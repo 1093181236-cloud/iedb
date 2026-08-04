@@ -1,0 +1,16 @@
+# iedb/configs/agent.toml.example
+# Minimal config for running iedb in agent mode:
+#   iedb --mode agent --config configs/agent.toml
+#
+# [wal] and [flush] sections are optional — defaults are applied
+# (wal.flush_interval_secs=1, flush.backend="http", snapshot_interval="10m").
+
+[server]
+port = 8080
+
+[data]
+dir = "/var/lib/iedb"
+
+[agent]
+id = "agent-01"
+server_url = "http://iedb-server:8080"
