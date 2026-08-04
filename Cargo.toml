@@ -8,7 +8,7 @@ default = ["mix"]
 agent = ["dep:parquet", "dep:bitcode", "dep:influxdb-line-protocol",
          "dep:reqwest", "dep:aws-sigv4", "dep:aws-credential-types", "dep:aws-smithy-runtime-api",
          "dep:crc32fast"]
-server = ["dep:datafusion", "dep:arrow", "dep:object_store", "dep:rusqlite"]
+server = ["dep:datafusion", "dep:arrow", "dep:object_store", "dep:rusqlite", "dep:parquet"]
 mix = ["agent", "server"]
 
 [dependencies]
