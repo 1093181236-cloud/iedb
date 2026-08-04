@@ -1,0 +1,47 @@
+[package]
+name = "iedb"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["mix"]
+agent = ["dep:parquet", "dep:bitcode", "dep:influxdb-line-protocol",
+         "dep:reqwest", "dep:aws-sigv4", "dep:aws-credential-types", "dep:crc32fast"]
+server = ["dep:datafusion", "dep:arrow", "dep:object_store", "dep:rusqlite"]
+mix = ["agent", "server"]
+
+[dependencies]
+# 始终依赖
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time", "signal"] }
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+chrono = "0.4"
+bytes = "1"
+url = "2"
+http-body-util = "0.1"
+http = "1"
+
+# agent feature 依赖
+parquet = { version = "53", optional = true, default-features = false, features = ["snap", "flate2"] }
+bitcode = { version = "0.6", optional = true, features = ["serde"] }
+influxdb-line-protocol = { version = "1.0", optional = true }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json"] }
+aws-sigv4 = { version = "1", optional = true }
+aws-credential-types = { version = "1", optional = true }
+crc32fast = { version = "1", optional = true }
+gethostname = "0.4"
+
+# server feature 依赖
+datafusion = { version = "40", optional = true }
+arrow = { version = "53", optional = true }
+object_store = { version = "0.11", optional = true }
+rusqlite = { version = "0.31", optional = true, features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
