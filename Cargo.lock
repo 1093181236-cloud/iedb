@@ -2140,6 +2140,7 @@ dependencies = [
  "arrow 53.4.1",
  "aws-credential-types",
  "aws-sigv4",
+ "aws-smithy-runtime-api",
  "bitcode",
  "bytes",
  "chrono",
