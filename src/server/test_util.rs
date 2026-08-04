@@ -44,3 +44,45 @@ impl hyper::body::Body for TestBody {
         self.0.size_hint()
     }
 }
+
+/// Build a minimal Parquet file with columns `time` (required int64:
+/// 1000/2000/3000) and `usage` (optional double: 1.5/2.5/3.5), 3 rows.
+pub fn make_test_parquet() -> Vec<u8> {
+    use parquet::data_type::{DoubleType, Int64Type};
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
+    use std::sync::Arc;
+
+    let schema = Arc::new(
+        parse_message_type("message schema { required int64 time; optional double usage; }")
+            .unwrap(),
+    );
+    let mut buf = Vec::new();
+    let props = Arc::new(WriterProperties::new());
+    let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+    let mut row_group = writer.next_row_group().unwrap();
+    {
+        let mut col = row_group.next_column().unwrap().unwrap();
+        col.typed::<Int64Type>()
+            .write_batch(&[1000i64, 2000, 3000], None, None)
+            .unwrap();
+        col.close().unwrap();
+    }
+    {
+        let mut col = row_group.next_column().unwrap().unwrap();
+        // optional double → max definition level 1, values require def levels
+        col.typed::<DoubleType>()
+            .write_batch(&[1.5, 2.5, 3.5], Some(&[1i16, 1, 1]), None)
+            .unwrap();
+        col.close().unwrap();
+    }
+    row_group.close().unwrap();
+    writer.close().unwrap();
+    buf
+}
+
+/// Write a test Parquet file (3 rows) to `path`.
+pub fn write_test_parquet(path: &std::path::Path) {
+    std::fs::write(path, make_test_parquet()).unwrap();
+}
