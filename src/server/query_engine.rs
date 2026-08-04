@@ -185,6 +185,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_query_table_not_exists_returns_error() {
+        let engine = QueryEngine::new(100, 10);
+        let err = engine.query("SELECT * FROM nonexistent.table").await.unwrap_err();
+        assert!(err.contains("SQL error"), "unexpected error: {}", err);
+    }
+
+    #[tokio::test]
     async fn test_query_times_out() {
         let (dir, _) = engine_with_data(100);
         let engine = QueryEngine::new(100, 0); // 0 秒超时 → 立即失败

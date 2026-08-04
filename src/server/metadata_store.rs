@@ -332,4 +332,23 @@ mod tests {
         let (_dir, store) = test_store();
         assert!(store.get_table("nope", "nope").await.unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn test_list_databases_excludes_duplicates() {
+        let (_dir, store) = test_store();
+        let fd = vec![("v".to_string(), "I64".to_string())];
+
+        store.update_stats("db1", "t1", 0, 100, 1, &fd, &[]).await.unwrap();
+        store.update_stats("db1", "t2", 0, 100, 1, &fd, &[]).await.unwrap();
+        store.update_stats("db2", "t1", 0, 100, 1, &fd, &[]).await.unwrap();
+
+        let dbs = store.list_databases().await.unwrap();
+        assert_eq!(dbs.len(), 2);
+        assert!(dbs.contains(&"db1".to_string()));
+        assert!(dbs.contains(&"db2".to_string()));
+
+        // 同一 db 下两张表独立统计
+        let tables = store.list_tables("db1").await.unwrap();
+        assert_eq!(tables.len(), 2);
+    }
 }

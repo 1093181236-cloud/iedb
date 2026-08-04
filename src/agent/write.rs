@@ -215,3 +215,213 @@ impl WriteHandler {
             .expect("valid response"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::buffer::Buffer;
+    use crate::agent::wal::wal_core::WalManager;
+    use crate::config::Config;
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tempfile::tempdir;
+
+    /// 与 server::test_util::TestBody 等价：Full<Bytes> 的 Error 是 Infallible，
+    /// 而 WriteHandler 要求 B::Error: Into<hyper::Error>，所以包一层（agent-only
+    /// 构建不能引用 server 模块）。
+    struct TestBody(Full<Bytes>);
+
+    impl TestBody {
+        fn empty() -> Self {
+            TestBody(Full::new(Bytes::new()))
+        }
+
+        fn from_bytes(bytes: Bytes) -> Self {
+            TestBody(Full::new(bytes))
+        }
+    }
+
+    impl hyper::body::Body for TestBody {
+        type Data = Bytes;
+        type Error = hyper::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            Pin::new(&mut self.get_mut().0)
+                .poll_frame(cx)
+                .map(|opt| opt.map(|res| res.map_err(|e: Infallible| match e {})))
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.0.is_end_stream()
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            self.0.size_hint()
+        }
+    }
+
+    async fn make_handler(
+        max_body_bytes: usize,
+        max_write_buffer_ops: usize,
+    ) -> (WriteHandler, Arc<Mutex<Buffer>>, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let toml = format!(
+            r#"
+            [server]
+            port = 0
+            max_body_bytes = {max_body_bytes}
+
+            [data]
+            dir = "{}"
+
+            [wal]
+            flush_interval_secs = 1
+            max_write_buffer_ops = {max_write_buffer_ops}
+
+            [flush]
+            snapshot_interval = "1s"
+            "#,
+            data_dir.display()
+        );
+        let config = Arc::new(toml::from_str::<Config>(&toml).unwrap());
+        let buffer = Arc::new(Mutex::new(Buffer::new()));
+        let wal = Arc::new(Mutex::new(
+            WalManager::new(&data_dir, &config.wal).await.unwrap(),
+        ));
+        let handler = WriteHandler {
+            buffer: buffer.clone(),
+            wal,
+            config,
+        };
+        (handler, buffer, dir)
+    }
+
+    fn post_req(uri: &str, body: &[u8]) -> Request<TestBody> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .body(TestBody::from_bytes(Bytes::from(body.to_vec())))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_non_post_returns_405() {
+        let (handler, _buffer, _dir) = make_handler(1024, 100).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/write?db=mydb")
+            .body(TestBody::empty())
+            .unwrap();
+        let resp = handler.handle(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(resp.body(), "POST only");
+    }
+
+    #[tokio::test]
+    async fn test_content_length_overflow_returns_413() {
+        let (handler, _buffer, _dir) = make_handler(64, 100).await;
+
+        // 声明 Content-Length 超限 → 不读 body 直接 413
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/write")
+            .header(hyper::header::CONTENT_LENGTH, 1024u32)
+            .body(TestBody::from_bytes(Bytes::from("small")))
+            .unwrap();
+        let resp = handler.handle(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(resp.body().contains("bytes limit"));
+    }
+
+    #[tokio::test]
+    async fn test_actual_body_overflow_returns_413() {
+        let (handler, _buffer, _dir) = make_handler(64, 100).await;
+
+        // 无 Content-Length 头、实际 body 超限（纵深防御）→ 413
+        let big_body = vec![b'a'; 100];
+        let resp = handler.handle(post_req("/write", &big_body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_utf8_returns_400() {
+        let (handler, _buffer, _dir) = make_handler(1024, 100).await;
+
+        // 非 UTF-8 body → 400，而不是 panic
+        let resp = handler.handle(post_req("/write", &[0xFF, 0xFE, 0x00, 0x00])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.body(), "invalid utf-8");
+    }
+
+    #[tokio::test]
+    async fn test_empty_body_returns_204() {
+        let (handler, _buffer, _dir) = make_handler(1024, 100).await;
+
+        // 空 body / 无法解析的行 → 0 行 204
+        let resp = handler.handle(post_req("/write?db=mydb", b"")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.body(), "0 rows");
+
+        let resp = handler.handle(post_req("/write?db=mydb", b"not valid line protocol")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.body(), "0 rows");
+    }
+
+    #[tokio::test]
+    async fn test_valid_write_stores_rows_and_wal() {
+        let (handler, buffer, dir) = make_handler(1024, 100).await;
+
+        let lp = "cpu,host=srv01 cpu=75.5,mem=62.3 1700000000000000000\n";
+        let resp = handler.handle(post_req("/write?db=mydb", lp.as_bytes())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.body(), "1 rows");
+
+        // 数据进入内存 buffer
+        let buf = buffer.lock().await;
+        let table = buf.get_table("mydb", "cpu").unwrap();
+        assert_eq!(table.schema.tag_keys, vec!["host".to_string()]);
+        let fields: Vec<String> = table.schema.field_defs.iter().map(|f| f.name.clone()).collect();
+        assert_eq!(fields, vec!["cpu".to_string(), "mem".to_string()]);
+        assert_eq!(table.chunks.len(), 1);
+        assert_eq!(table.chunks[0].rows.len(), 1);
+        assert_eq!(table.chunks[0].rows[0].time, 1700000000000000000);
+        assert_eq!(table.chunks[0].rows[0].tag_values, vec!["srv01".to_string()]);
+        // FieldValue 无 PartialEq，用匹配断言
+        match &table.chunks[0].rows[0].field_values[0] {
+            Some(BFieldValue::F64(v)) => assert!((v - 75.5).abs() < 1e-9),
+            other => panic!("expected F64(75.5), got {:?}", other),
+        }
+        drop(buf);
+
+        // WAL 文件已落盘
+        let wal_dir = dir.path().join("data").join("wal");
+        let wal_files: Vec<_> = std::fs::read_dir(&wal_dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "wal"))
+            .collect();
+        assert_eq!(wal_files.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_wal_buffer_full_returns_503() {
+        // max_write_buffer_ops = 1：单请求内两个 batch（不同 chunk_time）→ 第二个 buffer_op 失败
+        let (handler, buffer, _dir) = make_handler(1024, 1).await;
+
+        let lp = "cpu,host=srv01 cpu=75.5 1700000000000000000\n\
+                  cpu,host=srv01 cpu=30.0 1700000001000000000\n";
+        let resp = handler.handle(post_req("/write?db=mydb", lp.as_bytes())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.body().contains("WAL buffer error"));
+
+        // buffer 未收到任何行（WAL 拒绝后不应用）
+        let buf = buffer.lock().await;
+        assert!(buf.get_table("mydb", "cpu").is_none());
+    }
+}

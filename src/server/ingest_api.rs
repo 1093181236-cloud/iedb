@@ -273,6 +273,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_upload_defaults_db_and_table() {
+        let (_dir, h) = test_handler();
+
+        // 缺省 db/measurement query 参数 → default/unknown
+        let resp = h
+            .handle(upload_req("/api/v1/ingest/parquet", make_test_parquet(), "agent-1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let files: Vec<_> = std::fs::read_dir(h.data_dir.join("default").join("unknown"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].starts_with("agent-1_") && files[0].ends_with(".parquet"));
+
+        // 元数据同样落到 default.unknown
+        let detail = h.metadata.get_table("default", "unknown").await.unwrap().unwrap();
+        assert_eq!(detail.row_count, 3);
+    }
+
+    #[tokio::test]
     async fn test_upload_validation() {
         let (_dir, h) = test_handler();
 

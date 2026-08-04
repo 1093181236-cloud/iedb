@@ -242,6 +242,54 @@ mod server_tests {
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v["agents"].as_array().unwrap().len(), 1);
 
+        // agent heartbeat（当前版本无配置更新）
+        let resp = client
+            .post(format!("{}/api/v1/agents/heartbeat", base))
+            .header("Content-Type", "application/json")
+            .body(r#"{"id":"agent-01","config_version":1,"schema_changes":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["config_update"], serde_json::Value::Null);
+
+        // 推送配置 → target_version 递增
+        let resp = client
+            .put(format!("{}/api/v1/agents/agent-01/config", base))
+            .header("Content-Type", "application/json")
+            .body(r#"{"flush":{"memory_limit":"128MB"}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["target_version"], 2);
+
+        // 旧版本心跳 → 返回 config_update
+        let resp = client
+            .post(format!("{}/api/v1/agents/heartbeat", base))
+            .header("Content-Type", "application/json")
+            .body(r#"{"id":"agent-01","config_version":1,"schema_changes":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert!(v["config_update"].is_object());
+
+        // metadata table 详情：字段 + 行数
+        let resp = client
+            .get(format!("{}/api/v1/metadata/table?db=metrics&table=cpu", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["database"], "metrics");
+        assert_eq!(v["table"], "cpu");
+        assert_eq!(v["row_count"], 3);
+        assert!(v["fields"].as_array().unwrap().iter().any(|f| f["name"] == "usage"));
+
         // 未知路由 → 404
         let resp = client
             .get(format!("{}/nope", base))

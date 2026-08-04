@@ -127,3 +127,156 @@ impl AgentClient {
         Ok(body.config_update)
     }
 }
+
+/// Compare the buffer's current schema against `last_state`, returning the
+/// tables whose schema changed since the previous heartbeat. The first call
+/// (empty `last_state`) reports every table as changed. Used by the agent
+/// heartbeat loop; extracted here so the diff logic is unit-testable.
+pub fn compute_schema_changes(
+    buffer: &crate::agent::buffer::Buffer,
+    last_state: &mut std::collections::HashMap<String, (Vec<String>, Vec<(String, String)>)>,
+) -> Vec<SchemaChange> {
+    let mut changes = Vec::new();
+    for (db_name, tables) in &buffer.databases {
+        for (table_name, table) in tables {
+            let key = format!("{}.{}", db_name, table_name);
+            let tag_keys = table.schema.tag_keys.clone();
+            let field_defs: Vec<(String, String)> = table.schema
+                .field_defs
+                .iter()
+                .map(|f| (f.name.clone(), format!("{:?}", f.value_type)))
+                .collect();
+            let current = (tag_keys.clone(), field_defs.clone());
+            let changed = last_state.get(&key).map_or(true, |prev| prev != &current);
+            if changed {
+                changes.push(SchemaChange {
+                    db: db_name.clone(),
+                    table: table_name.clone(),
+                    tag_keys,
+                    field_defs,
+                });
+                last_state.insert(key, current);
+            }
+        }
+    }
+    changes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::buffer::Buffer;
+    use crate::agent::buffer::chunk::{Chunk, FieldType, FieldValue, Row};
+
+    /// Buffer with one table `mydb.cpu`: tags [host], fields [cpu, mem],
+    /// one chunk containing a single row.
+    fn buffer_with_schema() -> Buffer {
+        let mut buffer = Buffer::new();
+        let table = buffer.get_or_create_table("mydb", "cpu");
+        table.schema.ensure_tag_key("host");
+        table.schema.ensure_field("cpu", FieldType::F64);
+        table.schema.ensure_field("mem", FieldType::F64);
+
+        let mut chunk = Chunk::new(0);
+        chunk.rows.push(Row {
+            time: 100,
+            tag_values: vec!["srv01".to_string()],
+            field_values: vec![
+                Some(FieldValue::F64(75.5)),
+                Some(FieldValue::F64(62.3)),
+            ],
+        });
+        table.chunks.push(chunk);
+        buffer
+    }
+
+    #[test]
+    fn test_first_call_reports_all_tables() {
+        let buffer = buffer_with_schema();
+        let mut last_schema = std::collections::HashMap::new();
+
+        let changes = compute_schema_changes(&buffer, &mut last_schema);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].db, "mydb");
+        assert_eq!(changes[0].table, "cpu");
+        assert_eq!(changes[0].tag_keys, vec!["host".to_string()]);
+        assert_eq!(changes[0].field_defs.len(), 2);
+        assert!(changes[0].field_defs.iter().any(|(n, t)| n == "cpu" && t == "F64"));
+    }
+
+    #[test]
+    fn test_unchanged_schema_yields_no_changes() {
+        let buffer = buffer_with_schema();
+        let mut last_schema = std::collections::HashMap::new();
+
+        let _ = compute_schema_changes(&buffer, &mut last_schema);
+        let changes2 = compute_schema_changes(&buffer, &mut last_schema);
+        assert!(changes2.is_empty(), "unchanged schema should produce no changes");
+    }
+
+    #[test]
+    fn test_detects_new_field() {
+        let mut buffer = buffer_with_schema();
+        let mut last_schema = std::collections::HashMap::new();
+        let _ = compute_schema_changes(&buffer, &mut last_schema);
+
+        buffer.get_table_mut("mydb", "cpu").unwrap()
+            .schema.ensure_field("temp", FieldType::F64);
+
+        let changes = compute_schema_changes(&buffer, &mut last_schema);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].field_defs.iter().any(|(n, _)| n == "temp"),
+            "should detect new field, got: {:?}", changes[0].field_defs);
+    }
+
+    #[test]
+    fn test_detects_new_tag() {
+        let mut buffer = buffer_with_schema();
+        let mut last_schema = std::collections::HashMap::new();
+        let _ = compute_schema_changes(&buffer, &mut last_schema);
+
+        buffer.get_table_mut("mydb", "cpu").unwrap()
+            .schema.ensure_tag_key("region");
+
+        let changes = compute_schema_changes(&buffer, &mut last_schema);
+        assert!(changes.iter().any(|c| c.tag_keys.contains(&"region".to_string())));
+    }
+
+    #[test]
+    fn test_detects_new_table() {
+        let mut buffer = buffer_with_schema();
+        let mut last_schema = std::collections::HashMap::new();
+        let _ = compute_schema_changes(&buffer, &mut last_schema);
+
+        // 新表加入同一 db
+        let table = buffer.get_or_create_table("mydb", "mem");
+        table.schema.ensure_field("used", FieldType::F64);
+
+        let changes = compute_schema_changes(&buffer, &mut last_schema);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].table, "mem");
+        assert!(changes[0].field_defs.iter().any(|(n, _)| n == "used"));
+    }
+
+    #[tokio::test]
+    async fn test_register_requires_agent_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!(
+            r#"
+            [server]
+            [data]
+            dir = "{}"
+            "#,
+            dir.path().display()
+        );
+        let config: crate::config::Config = toml::from_str(&toml).unwrap();
+        let client = AgentClient::new(std::sync::Arc::new(config));
+
+        let err = client.register().await;
+        assert!(err.is_err(), "register without [agent] config should fail");
+        assert!(err.unwrap_err().contains("missing [agent] config"));
+
+        let err = client.heartbeat(1, Vec::new()).await;
+        assert!(err.is_err(), "heartbeat without [agent] config should fail");
+    }
+}

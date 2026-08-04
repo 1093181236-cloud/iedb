@@ -86,33 +86,11 @@ async fn run_agent(config: Arc<iedb::config::Config>) -> Result<(), Box<dyn std:
                 _ = hb_shutdown.notified() => break,
                 _ = interval.tick() => {}
             }
-            // 检测 schema 变更
-            let mut schema_changes = Vec::new();
-            {
+            // 检测 schema 变更（对比上次快照，逻辑见 iedb::agent::compute_schema_changes）
+            let schema_changes = {
                 let buf = hb_buffer.lock().await;
-                for (db_name, tables) in &buf.databases {
-                    for (table_name, table) in tables {
-                        let key = format!("{}.{}", db_name, table_name);
-                        let tag_keys = table.schema.tag_keys.clone();
-                        let field_defs: Vec<(String, String)> = table.schema
-                            .field_defs
-                            .iter()
-                            .map(|f| (f.name.clone(), format!("{:?}", f.value_type)))
-                            .collect();
-                        let current = (tag_keys.clone(), field_defs.clone());
-                        let changed = last_schema.get(&key).map_or(true, |prev| prev != &current);
-                        if changed {
-                            schema_changes.push(iedb::agent::SchemaChange {
-                                db: db_name.clone(),
-                                table: table_name.clone(),
-                                tag_keys,
-                                field_defs,
-                            });
-                            last_schema.insert(key, current);
-                        }
-                    }
-                }
-            }
+                iedb::agent::compute_schema_changes(&buf, &mut last_schema)
+            };
             match hb_client.heartbeat(config_version, schema_changes).await {
                 Ok(Some(_update)) => {
                     // 增量配置更新：Task 9 实现具体应用逻辑，此处仅推进版本号

@@ -137,6 +137,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_databases_empty() {
+        let (_dir, h) = test_handler();
+
+        let resp = h.handle(get_req("/api/v1/metadata/databases")).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let v: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+        assert!(v["databases"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_list_databases() {
         let (_dir, h) = test_handler();
         seed(&h.store).await;
