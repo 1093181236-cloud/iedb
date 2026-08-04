@@ -16,3 +16,111 @@ mod test_util;
 pub use agent_api::AgentApiHandler;
 pub use ingest_api::IngestApiHandler;
 pub use metadata_api::MetadataApiHandler;
+
+use crate::config::Config;
+use crate::server::agent_store::AgentStore;
+use crate::server::compaction::CompactionScheduler;
+use crate::server::db::Db;
+use crate::server::metadata_store::MetadataStore;
+use crate::server::query_engine::QueryEngine;
+use crate::server::sql_api::SqlApiHandler;
+use crate::server::table_provider::TableProvider;
+use hyper::service::service_fn;
+use std::sync::Arc;
+
+/// Server mode 入口：SQLite 元数据 → 存储层 → DataFusion 查询引擎 →
+/// Parquet 表注册 → Compaction 后台任务 → HTTP API 服务。
+pub async fn run_server(config: Arc<Config>) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = &config.data.dir;
+    std::fs::create_dir_all(data_dir)?;
+
+    // SQLite（agent / 元数据存储）
+    let metadata_cfg = config
+        .metadata
+        .as_ref()
+        .ok_or("missing [metadata] config section")?;
+    let db = Arc::new(Db::open(&metadata_cfg.db_path)?);
+
+    // 存储层
+    let agent_store = Arc::new(AgentStore::new(db.clone()));
+    let metadata = Arc::new(MetadataStore::new(db.clone()));
+
+    // DataFusion 查询引擎 + 启动时注册已有 Parquet 表
+    let query_cfg = config
+        .query
+        .as_ref()
+        .ok_or("missing [query] config section")?;
+    std::fs::create_dir_all(&query_cfg.data_dir)?;
+    let engine = Arc::new(QueryEngine::new(
+        query_cfg.max_rows,
+        query_cfg.query_timeout_secs,
+    ));
+    TableProvider::register_all(&engine, &query_cfg.data_dir).await?;
+
+    // Compaction 后台任务
+    if let Some(compaction_cfg) = config.compaction.as_ref() {
+        let scheduler = CompactionScheduler {
+            data_dir: query_cfg.data_dir.clone(),
+            metadata: metadata.clone(),
+            config: compaction_cfg.clone(),
+        };
+        tokio::spawn(async move { scheduler.run().await; });
+    }
+
+    // HTTP handlers
+    let agent_api = Arc::new(AgentApiHandler {
+        store: agent_store.clone(),
+    });
+    let ingest_api = Arc::new(IngestApiHandler {
+        data_dir: query_cfg.data_dir.clone(),
+        metadata: metadata.clone(),
+        engine: Some(engine.clone()),
+    });
+    let sql_api = Arc::new(SqlApiHandler { engine: engine.clone() });
+    let metadata_api = Arc::new(MetadataApiHandler {
+        store: metadata.clone(),
+    });
+
+    let addr: std::net::SocketAddr = format!("{}:{}", config.server.host, config.server.port)
+        .parse()
+        .map_err(|e| format!("invalid bind address: {}", e))?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("Server listening on http://{}", addr);
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let agent_api = agent_api.clone();
+        let ingest_api = ingest_api.clone();
+        let sql_api = sql_api.clone();
+        let metadata_api = metadata_api.clone();
+
+        tokio::spawn(async move {
+            let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                let agent = agent_api.clone();
+                let ingest = ingest_api.clone();
+                let sql = sql_api.clone();
+                let metadata = metadata_api.clone();
+                async move {
+                    let path = req.uri().path().to_string();
+                    match (req.method(), path.as_str()) {
+                        (_, p) if p.starts_with("/api/v1/agents") => agent.handle(req).await,
+                        (_, "/api/v1/ingest/parquet") => ingest.handle(req).await,
+                        (_, "/api/v1/query") => sql.handle(req).await,
+                        (_, p) if p.starts_with("/api/v1/metadata") => metadata.handle(req).await,
+                        (_, "/health") => Ok(hyper::Response::new("ok".into())),
+                        _ => Ok(hyper::Response::builder()
+                            .status(404)
+                            .body("not found".into())
+                            .unwrap()),
+                    }
+                }
+            });
+            let _ = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .serve_connection(io, svc)
+            .await;
+        });
+    }
+}

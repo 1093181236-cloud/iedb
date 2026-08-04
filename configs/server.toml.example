@@ -1,0 +1,33 @@
+# iedb/configs/server.toml.example
+# Minimal config for running iedb in server mode:
+#   iedb --mode server --config configs/server.toml.example
+#
+# [query]、[compaction]、[agents]、[metadata] 都是可选的（有默认值），
+# 但 server 模式必须提供 [metadata]（SQLite 元数据）和 [query]（查询引擎）。
+
+[server]
+host = "0.0.0.0"
+port = 8080
+
+[data]
+dir = "/var/lib/iedb"
+
+[query]
+data_dir = "/var/lib/iedb/data"
+query_timeout_secs = 30
+max_rows = 10000
+max_concurrent_queries = 4
+
+[compaction]
+enabled = true
+schedule = "0 */6 * * *"
+min_file_size_mb = 10
+target_file_size_mb = 128
+max_concurrent = 2
+
+[agents]
+heartbeat_timeout_secs = 30
+offline_cleanup_days = 7
+
+[metadata]
+db_path = "/var/lib/iedb/iedb.db"

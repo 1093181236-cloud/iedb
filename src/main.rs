@@ -1,7 +1,7 @@
 // iedb/src/main.rs
 use clap::Parser;
 
-#[cfg(feature = "agent")]
+#[cfg(any(feature = "agent", feature = "server"))]
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -230,14 +230,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         #[cfg(feature = "server")]
         "server" => {
-            tracing::info!("Server mode — awaiting Task 8 implementation");
-            Ok(())
+            let config = Arc::new(iedb::config::Config::from_file(&cli.config)?);
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(iedb::server::run_server(config))
         }
 
         #[cfg(all(feature = "agent", feature = "server"))]
         "mix" => {
-            tracing::info!("Mix mode — awaiting Task 10 implementation");
-            Ok(())
+            let config = Arc::new(iedb::config::Config::from_file(&cli.config)?);
+
+            // agent 与 server 都需要绑定本地 HTTP 端口：agent 的本地 API
+            // （POST /write, GET /query）使用 [server].port + 1，server 的
+            // API 使用 [server].port。agent 通过 [agent].server_url 上报
+            // 到 server 端口。
+            let mut agent_config = (*config).clone();
+            agent_config.server.port += 1;
+            let server_config = config.clone();
+            tracing::info!(
+                "Mix mode: agent API on port {}, server API on port {}",
+                agent_config.server.port,
+                server_config.server.port
+            );
+
+            let rt = tokio::runtime::Runtime::new()?;
+            // 两个长驻 future 并发执行（run_agent 的 future 非 Send，
+            // 不能 spawn 到多线程 runtime，用 select! 在同一任务内轮询）。
+            // 任一完成（如 agent 收到 Ctrl-C 优雅退出）时，另一个被 drop。
+            rt.block_on(async {
+                tokio::select! {
+                    r = run_agent(Arc::new(agent_config)) => r,
+                    r = iedb::server::run_server(server_config) => r,
+                }
+            })
         }
 
         _ => {

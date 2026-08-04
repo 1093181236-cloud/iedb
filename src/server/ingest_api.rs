@@ -2,6 +2,8 @@
 // under {data_dir}/{db}/{table}/, and updates table statistics from the
 // Parquet footer (time range, row count, field defs).
 use crate::server::metadata_store::MetadataStore;
+use crate::server::query_engine::QueryEngine;
+use crate::server::table_provider::TableProvider;
 use hyper::{Method, Request, Response};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,6 +11,8 @@ use std::sync::Arc;
 pub struct IngestApiHandler {
     pub data_dir: PathBuf,
     pub metadata: Arc<MetadataStore>,
+    /// 可选：有查询引擎时，写入后把新表注册到 DataFusion（ListingTable 自动发现后续文件）
+    pub engine: Option<Arc<QueryEngine>>,
 }
 
 impl IngestApiHandler {
@@ -76,15 +80,26 @@ impl IngestApiHandler {
             return Ok(json_err(500, &format!("write: {}", e)));
         }
 
-        // 读取 Parquet footer stats 并更新元数据
-        match read_parquet_stats(&filepath) {
-            Ok((time_min, time_max, row_count, field_defs)) => {
-                self.metadata
-                    .update_stats(&db, &table, time_min, time_max, row_count, &field_defs, &[])
-                    .await
-                    .ok();
+        // 读取 Parquet footer stats 并更新元数据。
+        // 注意：read_parquet_stats 的 Err 含 Box<dyn Error>（非 Send），
+        // 必须在此处消化掉，避免非 Send 值跨越 .await（server 连接需要 Send future）。
+        let stats = read_parquet_stats(&filepath)
+            .map_err(|e| {
+                tracing::warn!("failed to read parquet stats from {}: {}", filepath.display(), e);
+            })
+            .ok();
+        if let Some((time_min, time_max, row_count, field_defs)) = stats {
+            self.metadata
+                .update_stats(&db, &table, time_min, time_max, row_count, &field_defs, &[])
+                .await
+                .ok();
+        }
+
+        // 新表注册到 DataFusion（首次上传时；已注册的表是 no-op）
+        if let Some(engine) = &self.engine {
+            if let Err(e) = TableProvider::add_file(engine, &db, &table, &filepath).await {
+                tracing::warn!("register table after ingest: {}", e);
             }
-            Err(e) => tracing::warn!("failed to read parquet stats from {}: {}", filepath.display(), e),
         }
 
         Ok(Response::builder().status(200).body("ok".into()).unwrap())
@@ -209,6 +224,7 @@ mod tests {
         let handler = IngestApiHandler {
             data_dir: data_dir.clone(),
             metadata: Arc::new(MetadataStore::new(Arc::new(db))),
+            engine: None,
         };
         (dir, handler)
     }
@@ -286,6 +302,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 400);
+    }
+
+    #[tokio::test]
+    async fn test_upload_registers_table_in_query_engine() {
+        use crate::server::query_engine::QueryEngine;
+
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let db_path = dir.path().join("test.db");
+        let db = Db::open(&db_path).unwrap();
+        let engine = Arc::new(QueryEngine::new(100, 10));
+        let handler = IngestApiHandler {
+            data_dir: data_dir.clone(),
+            metadata: Arc::new(MetadataStore::new(Arc::new(db))),
+            engine: Some(engine.clone()),
+        };
+
+        let resp = handler
+            .handle(upload_req(
+                "/api/v1/ingest/parquet?db=metrics&measurement=cpu",
+                make_test_parquet(),
+                "agent-1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+
+        // 上传后新表立即可查询（DataFusion 表自动注册）
+        let result = engine.query("SELECT * FROM metrics.cpu").await.unwrap();
+        assert_eq!(result["returned_rows"], 3);
+        assert_eq!(result["rows"][0]["time"], 1000);
     }
 
     #[test]

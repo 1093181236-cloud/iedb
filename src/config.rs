@@ -30,12 +30,15 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default = "default_host")]
+    pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
 }
 
+fn default_host() -> String { "0.0.0.0".into() }
 fn default_port() -> u16 { 8080 }
 fn default_max_body_bytes() -> usize { 10 * 1024 * 1024 }
 
