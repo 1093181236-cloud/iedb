@@ -1,4 +1,5 @@
 use crate::agent::buffer::Buffer;
+use crate::agent::buffer::chunk::Table;
 use crate::config::Config;
 use crate::agent::flush::http_upload::{self, UploadError};
 use crate::agent::flush::parquet_writer::flush_chunks_to_parquet;
@@ -6,11 +7,15 @@ use crate::agent::flush::s3_upload;
 use crate::agent::wal::wal_core::WalManager;
 use reqwest::Client;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing;
+
+/// Callback invoked after a parquet file is written locally (mix mode).
+/// Arguments: db_name, table_name, file_path, table_schema
+pub type LocalFlushCallback = dyn Fn(&str, &str, &Path, &Table) + Send + Sync;
 
 pub struct SnapshotScheduler {
     pub buffer: Arc<Mutex<Buffer>>,
@@ -18,6 +23,7 @@ pub struct SnapshotScheduler {
     pub config: Arc<Config>,
     pub client: Client,
     pub staging_dir: PathBuf,
+    pub on_local_flush: Option<Arc<LocalFlushCallback>>,
 }
 
 impl SnapshotScheduler {
@@ -34,6 +40,7 @@ impl SnapshotScheduler {
             config,
             client,
             staging_dir,
+            on_local_flush: None,
         }
     }
 
@@ -157,8 +164,14 @@ impl SnapshotScheduler {
                         std::fs::create_dir_all(parent)
                             .map_err(|e| format!("local mkdir: {}", e))?;
                     }
-                    std::fs::write(&file_path, &parquet_data)
-                        .map_err(|e| format!("local write: {}", e))
+                    let result = std::fs::write(&file_path, &parquet_data)
+                        .map_err(|e| format!("local write: {}", e));
+                    if result.is_ok() {
+                        if let Some(ref cb) = self.on_local_flush {
+                            cb(db_name, table_name, &file_path, &table);
+                        }
+                    }
+                    result
                 }
                 "s3" => {
                     let s3_cfg = self.config.s3.as_ref().ok_or("S3 config missing")?;

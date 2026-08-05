@@ -1,5 +1,6 @@
 // iedb/src/main.rs
 use clap::Parser;
+use std::path::PathBuf;
 
 #[cfg(any(feature = "agent", feature = "server"))]
 use std::sync::Arc;
@@ -18,7 +19,12 @@ struct Cli {
 /// in-memory buffer + WAL pipeline, snapshot scheduler, and serves
 /// the local HTTP API (POST /write, GET /query, GET /health).
 #[cfg(feature = "agent")]
-async fn run_agent(config: Arc<iedb::config::Config>) -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(feature = "agent")]
+async fn run_agent(
+    config: Arc<iedb::config::Config>,
+    #[cfg_attr(not(feature = "server"), allow(unused_variables))]
+    _on_local_flush: Option<Arc<iedb::agent::flush::scheduler::LocalFlushCallback>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use iedb::agent::buffer::Buffer;
     use iedb::agent::flush::scheduler::SnapshotScheduler;
     use iedb::agent::query::QueryHandler;
@@ -127,12 +133,17 @@ async fn run_agent(config: Arc<iedb::config::Config>) -> Result<(), Box<dyn std:
     });
 
     // 7. Snapshot scheduler 后台任务
-    let snapshot_scheduler = SnapshotScheduler::new(
+    let mut snapshot_scheduler = SnapshotScheduler::new(
         buffer.clone(),
         wal_manager.clone(),
         config.clone(),
         client.clone(),
     );
+    #[cfg(feature = "server")]
+    if let Some(cb) = _on_local_flush {
+        snapshot_scheduler.on_local_flush = Some(cb);
+        tracing::info!("Mix mode: local flush callback installed");
+    }
     let snap_shutdown = shutdown_signal.clone();
     tokio::spawn(async move {
         tokio::select! {
@@ -203,7 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "agent" => {
             let config = Arc::new(iedb::config::Config::from_file(&cli.config)?);
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run_agent(config))
+            rt.block_on(run_agent(config, None))
         }
 
         #[cfg(feature = "server")]
@@ -230,13 +241,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 server_config.server.port
             );
 
+            // Mix mode metadata callback: after agent flush writes a local
+            // parquet file, update the shared SQLite metadata DB so the
+            // server's DataFusion engine discovers the new table/data.
+            use iedb::agent::buffer::chunk::Table;
+            use iedb::agent::flush::scheduler::LocalFlushCallback;
+            let db_path = server_config
+                .metadata
+                .as_ref()
+                .map(|m| m.db_path.clone())
+                .unwrap_or_else(|| PathBuf::from("/var/lib/iedb/iedb.db"));
+            let on_local_flush: Arc<LocalFlushCallback> = Arc::new(
+                move |db_name: &str, table_name: &str, file_path: &std::path::Path, table: &Table| {
+                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                        let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+                        let _ = conn.execute(
+                            "INSERT OR IGNORE INTO databases (name) VALUES (?1)",
+                            rusqlite::params![db_name],
+                        );
+                        let _ = conn.execute(
+                            "INSERT OR IGNORE INTO tables (db_name, table_name) VALUES (?1, ?2)",
+                            rusqlite::params![db_name, table_name],
+                        );
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let _ = conn.execute(
+                            "UPDATE tables SET updated_at=?1 WHERE db_name=?2 AND table_name=?3",
+                            rusqlite::params![now_ms, db_name, table_name],
+                        );
+                        for f in &table.schema.field_defs {
+                            let _ = conn.execute(
+                                "INSERT OR IGNORE INTO fields (table_id, name, value_type, is_tag) \
+                                 SELECT id, ?1, ?2, 0 FROM tables WHERE db_name=?3 AND table_name=?4",
+                                rusqlite::params![f.name, format!("{:?}", f.value_type), db_name, table_name],
+                            );
+                        }
+                        for tk in &table.schema.tag_keys {
+                            let _ = conn.execute(
+                                "INSERT OR IGNORE INTO fields (table_id, name, value_type, is_tag) \
+                                 SELECT id, ?1, 'String', 1 FROM tables WHERE db_name=?2 AND table_name=?3",
+                                rusqlite::params![tk, db_name, table_name],
+                            );
+                        }
+                        tracing::info!(
+                            db = db_name, table = table_name, file = %file_path.display(),
+                            "Mix mode: local flush metadata updated"
+                        );
+                    }
+                },
+            );
+
             let rt = tokio::runtime::Runtime::new()?;
             // 两个长驻 future 并发执行（run_agent 的 future 非 Send，
             // 不能 spawn 到多线程 runtime，用 select! 在同一任务内轮询）。
             // 任一完成（如 agent 收到 Ctrl-C 优雅退出）时，另一个被 drop。
             rt.block_on(async {
                 tokio::select! {
-                    r = run_agent(Arc::new(agent_config)) => r,
+                    r = run_agent(Arc::new(agent_config), Some(on_local_flush)) => r,
                     r = iedb::server::run_server(server_config) => r,
                 }
             })

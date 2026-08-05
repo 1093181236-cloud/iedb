@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 pub struct SqlApiHandler {
     pub engine: Arc<QueryEngine>,
+    pub data_dir: std::path::PathBuf,
 }
 
 impl SqlApiHandler {
@@ -33,6 +34,22 @@ impl SqlApiHandler {
                 .header("Content-Type", "application/json")
                 .body(result.to_string())
                 .unwrap()),
+            Err(e) if e.contains("table") && e.contains("not found") => {
+                // 表尚未注册：尝试从 data_dir 按需注册
+                use crate::server::table_provider::TableProvider;
+                if let Err(re) = TableProvider::register_all(&self.engine, &self.data_dir).await {
+                    tracing::warn!("Lazy table registration failed: {}", re);
+                }
+                // 重试一次
+                match self.engine.query(sql).await {
+                    Ok(result) => Ok(Response::builder()
+                        .status(200)
+                        .header("Content-Type", "application/json")
+                        .body(result.to_string())
+                        .unwrap()),
+                    Err(e2) => Ok(json_err(422, &e2)),
+                }
+            }
             Err(e) => Ok(json_err(422, &e)),
         }
     }
@@ -73,9 +90,10 @@ mod tests {
         std::fs::create_dir_all(&table_dir).unwrap();
         write_test_parquet(&table_dir.join("a.parquet"));
 
+        let data_dir = dir.path().to_path_buf();
         let engine = Arc::new(QueryEngine::new(max_rows, 10));
-        TableProvider::register_all(&engine, dir.path()).await.unwrap();
-        (dir, SqlApiHandler { engine })
+        TableProvider::register_all(&engine, &data_dir).await.unwrap();
+        (dir, SqlApiHandler { engine, data_dir })
     }
 
     fn json_req(method: &str, body: &str) -> Request<TestBody> {

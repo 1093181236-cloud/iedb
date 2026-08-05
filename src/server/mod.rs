@@ -76,7 +76,7 @@ pub async fn run_server(config: Arc<Config>) -> Result<(), Box<dyn std::error::E
         metadata: metadata.clone(),
         engine: Some(engine.clone()),
     });
-    let sql_api = Arc::new(SqlApiHandler { engine: engine.clone() });
+    let sql_api = Arc::new(SqlApiHandler { engine: engine.clone(), data_dir: query_cfg.data_dir.clone() });
     let metadata_api = Arc::new(MetadataApiHandler {
         store: metadata.clone(),
     });
