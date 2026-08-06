@@ -44,19 +44,6 @@ async fn run_agent(
     std::fs::create_dir_all(data_dir.join("meta"))?;
     std::fs::create_dir_all(data_dir.join("staging"))?;
 
-    // 1. Agent 注册（获取运行配置）
-    let agent_client = Arc::new(AgentClient::new(config.clone()));
-    let (_remote_config, mut config_version) = match agent_client.register().await {
-        Ok((cfg, ver)) => {
-            tracing::info!("Agent registered, config_version={}", ver);
-            (cfg, ver)
-        }
-        Err(e) => {
-            tracing::warn!("Registration failed: {}, using local/cached config", e);
-            (serde_json::Value::Null, 0u64)
-        }
-    };
-
     // 2. 初始化 Buffer + WAL
     let buffer = Arc::new(Mutex::new(Buffer::new()));
     let wal_manager = Arc::new(Mutex::new(WalManager::new(&data_dir, &config.wal).await?));
@@ -67,7 +54,7 @@ async fn run_agent(
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    // 4. 关闭信号：Ctrl-C 触发 notify_waiters，所有后台任务与 HTTP server 退出
+    // 4. 关闭信号
     let shutdown_signal = Arc::new(Notify::new());
     let ctrl_shutdown = shutdown_signal.clone();
     tokio::spawn(async move {
@@ -78,15 +65,29 @@ async fn run_agent(
         ctrl_shutdown.notify_waiters();
     });
 
-    // 5. 心跳后台任务
-    let hb_client = agent_client.clone();
-    let hb_buffer = buffer.clone();
-    let hb_shutdown = shutdown_signal.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        // schema 快照对比（用于检测 schema 变更）
-        let mut last_schema: std::collections::HashMap<String, (Vec<String>, Vec<(String, String)>)> =
-            std::collections::HashMap::new();
+    // In mix mode (_on_local_flush is Some), skip remote registration/heartbeat
+    let is_mix = _on_local_flush.is_some();
+    let agent_client = if is_mix { None } else { Some(Arc::new(AgentClient::new(config.clone()))) };
+
+    if !is_mix {
+        if let Some(ref ac) = agent_client {
+            match ac.register().await {
+                Ok((_cfg, ver)) => tracing::info!("Agent registered, config_version={}", ver),
+                Err(e) => tracing::warn!("Registration failed: {}, using local/cached config", e),
+            }
+        }
+    }
+
+    // 5. 心跳后台任务 (agent mode only — mix skips)
+    let mut config_version: u64 = 0;
+    if !is_mix {
+        let hb_client = agent_client.clone().unwrap();
+        let hb_buffer = buffer.clone();
+        let hb_shutdown = shutdown_signal.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut last_schema: std::collections::HashMap<String, (Vec<String>, Vec<(String, String)>)> =
+                std::collections::HashMap::new();
         loop {
             tokio::select! {
                 _ = hb_shutdown.notified() => break,
@@ -108,6 +109,7 @@ async fn run_agent(
             }
         }
     });
+    } // end if !is_mix
 
     // 6. WAL flush 后台任务
     let wal_flush = wal_manager.clone();
@@ -121,11 +123,21 @@ async fn run_agent(
                 _ = wal_shutdown.notified() => break,
                 _ = interval.tick() => {}
             }
-            if let Ok(ops) = wal_flush.lock().await.flush().await {
+            // C1 fix: scope wal guard release before acquiring buffer lock
+            let ops = {
+                let mut wal_guard = wal_flush.lock().await;
+                match wal_guard.flush().await {
+                    Ok(ops) => ops,
+                    Err(e) => { tracing::error!(%e, "WAL flush failed"); continue; }
+                }
+            };
+            // wal guard dropped here — buffer lock acquired below
+            if !ops.is_empty() {
+                let wal_seq = wal_flush.lock().await.current_sequence().saturating_sub(1);
                 let mut buf = wal_buffer.lock().await;
                 for op in &ops {
                     if let WalOp::Write(batch) = op {
-                        apply_write_batch(&mut buf, batch, 0);
+                        apply_write_batch(&mut buf, batch, wal_seq);
                     }
                 }
             }
@@ -264,9 +276,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             rusqlite::params![db_name, table_name],
                         );
                         let now_ms = chrono::Utc::now().timestamp_millis();
+                        // I13 fix: update time range and row count from flushed chunks
+                        let (time_min, time_max, chunk_rows) = {
+                            let (mut tmin, mut tmax, mut cnt) = (i64::MAX, i64::MIN, 0usize);
+                            for c in &table.chunks {
+                                tmin = tmin.min(c.time_min);
+                                tmax = tmax.max(c.time_max);
+                                cnt += c.rows.len();
+                            }
+                            (if tmin == i64::MAX { 0 } else { tmin },
+                             if tmax == i64::MIN { 0 } else { tmax },
+                             cnt)
+                        };
                         let _ = conn.execute(
-                            "UPDATE tables SET updated_at=?1 WHERE db_name=?2 AND table_name=?3",
-                            rusqlite::params![now_ms, db_name, table_name],
+                            "UPDATE tables SET time_min=MIN(COALESCE(time_min,?1),?1), time_max=MAX(COALESCE(time_max,?2),?2), total_rows=total_rows+?3, updated_at=?4 WHERE db_name=?5 AND table_name=?6",
+                            rusqlite::params![time_min, time_max, chunk_rows as i64, now_ms, db_name, table_name],
                         );
                         for f in &table.schema.field_defs {
                             let _ = conn.execute(

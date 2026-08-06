@@ -45,7 +45,8 @@ pub fn flush_chunks_to_parquet(table: &Table, chunks: &[&Chunk]) -> Result<Vec<u
     // Step 2: Collect and merge-sort all rows
     let mut all_rows: Vec<&Row> = chunks.iter().flat_map(|c| c.rows.iter()).collect();
     all_rows.sort_by_key(|r| r.time);
-    all_rows.dedup_by(|a, b| a.time == b.time && a.tag_values == b.tag_values);
+    // C2 fix: dedup by full row identity (time + tags + fields), not just time+tags
+    all_rows.dedup_by(|a, b| a.time == b.time && a.tag_values == b.tag_values && a.field_values == b.field_values);
 
     // Step 3: Write to Parquet using the column-oriented writer API
     let mut buf = Vec::new();

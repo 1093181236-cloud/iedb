@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// A field value in a time-series row.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FieldValue {
     I64(i64),
     F64(f64),
@@ -78,7 +78,7 @@ impl TableSchema {
 }
 
 /// A row stores only values; keys come from TableSchema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Row {
     pub time: i64,
     pub tag_values: Vec<String>,

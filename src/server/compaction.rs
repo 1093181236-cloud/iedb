@@ -111,14 +111,14 @@ impl CompactionScheduler {
                     .await
                     .map_err(|e| format!("write parquet: {}", e))?;
 
-                // 原子替换：先删除旧文件，再重命名临时文件
-                for (_, old_path) in &small_files {
-                    let _ = std::fs::remove_file(old_path);
-                }
+                // I7 fix: rename first, then delete originals (crash-safe)
                 let final_path = table_entry
                     .path()
                     .join(format!("compacted_{}.parquet", chrono::Utc::now().timestamp_millis()));
                 std::fs::rename(&tmp_path, &final_path).map_err(|e| format!("rename: {}", e))?;
+                for (_, old_path) in &small_files {
+                    let _ = std::fs::remove_file(old_path);
+                }
 
                 tracing::info!(
                     db = %db_name,
