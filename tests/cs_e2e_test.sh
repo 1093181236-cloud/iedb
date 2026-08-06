@@ -88,6 +88,7 @@ EOF
 cat > "$TMP/agent.toml" << EOF
 [server]
 port = 18081
+max_body_bytes = 102400
 
 [data]
 dir = "$TMP/agent-data"
