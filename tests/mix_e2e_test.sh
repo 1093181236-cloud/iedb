@@ -151,9 +151,9 @@ check_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST 'http://127.0.0.1:180
 check_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST 'http://127.0.0.1:18080/api/v1/query' -H 'Content-Type: application/json' -d '{}')" "400" "400: empty SQL"
 check_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST 'http://127.0.0.1:18081/write?db=test' -d "$(python3 -c "print('x'*200000)")")" "413" "413: oversized body"
 
-# ── 12. Mix has no agent API ──
-info "12. No agent management in mix"
-check_eq "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:18080/api/v1/agents')" "404" "404: /agents not in mix"
+# ── 12. Agent API available in mix ──
+info "12. Agent API in mix mode"
+check_eq "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:18080/api/v1/agents')" "200" "200: /agents available in mix"
 
 echo ""
 echo "========================================="
