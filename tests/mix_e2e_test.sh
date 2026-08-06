@@ -62,7 +62,7 @@ memory_limit = "512MB"
 [query]
 data_dir = "$TMP/data"
 query_timeout_secs = 30
-max_rows = 100
+max_rows = 50
 max_concurrent_queries = 4
 
 [compaction]
@@ -137,7 +137,7 @@ check_ok "$(curl -sf 'http://127.0.0.1:18080/api/v1/metadata/table?db=mydb&table
 
 # ── 10. Truncation ──
 info "10. Truncation"
-for i in $(seq 0 150); do
+for i in $(seq 0 60); do
   TS=$(( ($(date +%s) - 3600 + $i) * 1000000000 ))
   curl -s -o /dev/null -X POST "http://127.0.0.1:18081/write?db=bigdb" -d "big,idx=x val=$i $TS" || true
 done
