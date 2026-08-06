@@ -48,6 +48,10 @@ if [ ! -x "$BIN" ]; then
   (cd "$(dirname "$0")/.." && cargo build)
 fi
 
+# Kill stale processes from previous runs
+pkill -9 -f "iedb --mode" 2>/dev/null || true
+sleep 1
+
 mkdir -p "$TMP/server-data" "$TMP/agent-data"
 
 # ── Server config ──
