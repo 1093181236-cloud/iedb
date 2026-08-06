@@ -107,6 +107,11 @@ impl IngestApiHandler {
                 .await
                 .ok();
         }
+        // Record agent→table relationship from ingest
+        self.metadata
+            .merge_schema(&db, &table, &agent_id, &[], &[])
+            .await
+            .ok();
 
         // 新表注册到 DataFusion（首次上传时；已注册的表是 no-op）
         if let Some(engine) = &self.engine {

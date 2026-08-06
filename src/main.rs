@@ -347,6 +347,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 rusqlite::params![tk, db_name, table_name],
                             );
                         }
+                        // Record mix as a data source for this table
+                        let _ = conn.execute(
+                            "INSERT OR IGNORE INTO agent_tables (agent_id, table_id) \
+                             SELECT 'local', id FROM tables WHERE db_name=?1 AND table_name=?2",
+                            rusqlite::params![db_name, table_name],
+                        );
                         tracing::info!(
                             db = db_name, table = table_name, file = %file_path.display(),
                             "Mix mode: local flush metadata updated"
