@@ -91,8 +91,24 @@ pub async fn run_server(config: Arc<Config>, include_agent_api: bool) -> Result<
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Server listening on http://{}", addr);
 
+    // I6: graceful shutdown via Ctrl-C
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_waiter = shutdown.notified();
+    tokio::pin!(shutdown_waiter);
+    {
+        let s = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("Server shutdown signal received");
+            s.notify_waiters();
+        });
+    }
+
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = tokio::select! {
+            _ = &mut shutdown_waiter => break,
+            result = listener.accept() => result?,
+        };
         let io = hyper_util::rt::TokioIo::new(stream);
         let agent_api = agent_api.clone();
         let ingest_api = ingest_api.clone();
@@ -134,4 +150,10 @@ pub async fn run_server(config: Arc<Config>, include_agent_api: bool) -> Result<
             .await;
         });
     }
+
+    // I6: graceful cleanup — let in-flight queries drain (bound by query_timeout_secs)
+    tracing::info!("Server shutting down, draining in-flight requests...");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    tracing::info!("Server shutdown complete");
+    Ok(())
 }

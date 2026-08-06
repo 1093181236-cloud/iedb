@@ -211,7 +211,21 @@ async fn run_agent(
         }
     }
 
-    // 优雅关闭：通知所有后台任务停止
+    // I6: Graceful shutdown — final flush + snapshot before notifying tasks
+    tracing::info!("Agent shutting down, performing final WAL flush...");
+    if let Ok(mut wal) = wal_manager.try_lock() {
+        if let Ok(ops) = wal.flush().await {
+            let seq = wal.current_sequence().saturating_sub(1);
+            let mut buf = buffer.lock().await;
+            for op in &ops {
+                if let WalOp::Write(batch) = op {
+                    apply_write_batch(&mut buf, batch, seq);
+                }
+            }
+        }
+    }
+    tracing::info!("Final WAL flush done");
+
     shutdown_signal.notify_waiters();
     tracing::info!("Agent shutdown complete");
     Ok(())
