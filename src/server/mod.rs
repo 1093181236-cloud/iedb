@@ -77,6 +77,7 @@ pub async fn run_server(config: Arc<Config>, include_agent_api: bool) -> Result<
     let ingest_api = Arc::new(IngestApiHandler {
         data_dir: query_cfg.data_dir.clone(),
         metadata: metadata.clone(),
+        max_body_bytes: config.server.max_body_bytes as usize,
         engine: Some(engine.clone()),
     });
     let sql_api = Arc::new(SqlApiHandler { engine: engine.clone(), data_dir: query_cfg.data_dir.clone() });

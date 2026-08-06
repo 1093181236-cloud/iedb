@@ -122,7 +122,7 @@ impl AgentApiHandler {
                     };
                     serde_json::json!({
                         "id": a.id, "hostname": a.hostname, "status": status,
-                        "last_seen": a.last_seen_at,
+                        "last_seen": a.last_seen_at.map(ms_to_iso8601),
                         "config_version": a.config_version,
                         "target_config_version": a.target_config_version,
                     })
@@ -162,6 +162,15 @@ impl AgentApiHandler {
             Err(e) => Ok(json_response(500, &format!(r#"{{"error":"{}","code":"INTERNAL"}}"#, e))),
         }
     }
+}
+
+/// I9 fix: convert Unix ms to ISO 8601 string
+fn ms_to_iso8601(ts_ms: i64) -> String {
+    let secs = ts_ms / 1000;
+    let nanos = ((ts_ms % 1000) * 1_000_000) as u32;
+    chrono::DateTime::from_timestamp(secs, nanos)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| format!("{}", ts_ms))
 }
 
 fn json_response(status: u16, body: &str) -> Response<String> {

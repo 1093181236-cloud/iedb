@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub struct IngestApiHandler {
     pub data_dir: PathBuf,
     pub metadata: Arc<MetadataStore>,
+    pub max_body_bytes: usize,
     /// 可选：有查询引擎时，写入后把新表注册到 DataFusion（ListingTable 自动发现后续文件）
     pub engine: Option<Arc<QueryEngine>>,
 }
@@ -62,9 +63,21 @@ impl IngestApiHandler {
             .map(sanitize_filename_part)
             .unwrap_or_else(|| "unknown".into());
 
+        // I5 fix: enforce body size limit before buffering
+        let content_length = req.headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if content_length > self.max_body_bytes {
+            return Ok(json_err(413, "PAYLOAD_TOO_LARGE"));
+        }
         // 读取 body (Parquet bytes)
         use http_body_util::BodyExt;
         let body = req.collect().await?.to_bytes();
+        if body.len() > self.max_body_bytes {
+            return Ok(json_err(413, "PAYLOAD_TOO_LARGE"));
+        }
 
         // 写入文件 {data_dir}/{db}/{table}/{agent_id}_{ts}.parquet
         let table_dir = self.data_dir.join(&db).join(&table);
@@ -225,6 +238,7 @@ mod tests {
             data_dir: data_dir.clone(),
             metadata: Arc::new(MetadataStore::new(Arc::new(db))),
             engine: None,
+            max_body_bytes: 10 * 1024 * 1024,
         };
         (dir, handler)
     }
@@ -340,6 +354,7 @@ mod tests {
             data_dir: data_dir.clone(),
             metadata: Arc::new(MetadataStore::new(Arc::new(db))),
             engine: Some(engine.clone()),
+            max_body_bytes: 10 * 1024 * 1024,
         };
 
         let resp = handler
