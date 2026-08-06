@@ -1,10 +1,12 @@
 // HTTP handlers for agent management: register / heartbeat / list / get / update-config / delete.
 use crate::server::agent_store::AgentStore;
+use crate::server::metadata_store::MetadataStore;
 use hyper::{Method, Request, Response};
 use std::sync::Arc;
 
 pub struct AgentApiHandler {
     pub store: Arc<AgentStore>,
+    pub metadata: Option<Arc<MetadataStore>>,
 }
 
 impl AgentApiHandler {
@@ -93,6 +95,28 @@ impl AgentApiHandler {
         }
         if let Err(e) = self.store.heartbeat(id, config_version).await {
             return Ok(json_response(500, &format!(r#"{{"error":"{}","code":"INTERNAL"}}"#, e)));
+        }
+
+        // I4: extract and forward schema_changes to metadata store
+        if let Some(ref md) = self.metadata {
+            if let Some(changes) = req_data["schema_changes"].as_array() {
+                for entry in changes {
+                    let db = entry["db"].as_str().unwrap_or_default();
+                    let table = entry["table"].as_str().unwrap_or_default();
+                    let tag_keys: Vec<String> = entry["tag_keys"].as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    let field_defs: Vec<(String, String)> = entry["field_defs"].as_array()
+                        .map(|a| a.iter().filter_map(|v| {
+                            let arr = v.as_array()?;
+                            Some((arr.get(0)?.as_str()?.to_string(), arr.get(1)?.as_str()?.to_string()))
+                        }).collect())
+                        .unwrap_or_default();
+                    if !db.is_empty() && !table.is_empty() {
+                        let _ = md.merge_schema(db, table, id, &tag_keys, &field_defs).await;
+                    }
+                }
+            }
         }
 
         // 检查是否有配置更新
@@ -193,7 +217,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let db = Db::open(&db_path).unwrap();
-        let handler = AgentApiHandler { store: Arc::new(AgentStore::new(Arc::new(db))) };
+        let handler = AgentApiHandler { store: Arc::new(AgentStore::new(Arc::new(db))), metadata: None };
         (dir, handler)
     }
 

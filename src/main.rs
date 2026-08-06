@@ -69,17 +69,40 @@ async fn run_agent(
     let is_mix = _on_local_flush.is_some();
     let agent_client = if is_mix { None } else { Some(Arc::new(AgentClient::new(config.clone()))) };
 
+    let mut config_version: u64 = 0;
+    // I3: try loading cached config before registration (fallback if server unreachable)
+    if let Ok(cached) = std::fs::read_to_string(data_dir.join("agent_config.cache")) {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cached) {
+            tracing::info!("Loaded cached config from agent_config.cache");
+        }
+    }
+
     if !is_mix {
         if let Some(ref ac) = agent_client {
             match ac.register().await {
-                Ok((_cfg, ver)) => tracing::info!("Agent registered, config_version={}", ver),
-                Err(e) => tracing::warn!("Registration failed: {}, using local/cached config", e),
+                Ok((cfg, ver)) => {
+                    tracing::info!("Agent registered, config_version={}", ver);
+                    config_version = ver;
+                    // I3: apply server-provided config to runtime settings
+                    // Cache config for restart fallback
+                    if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+                        let _ = std::fs::write(data_dir.join("agent_config.cache"), &json);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Registration failed: {}, using local/cached config", e);
+                    // Try cache fallback
+                    if let Ok(cached) = std::fs::read_to_string(data_dir.join("agent_config.cache")) {
+                        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cached) {
+                            tracing::info!("Loaded cached config from agent_config.cache");
+                        }
+                    }
+                }
             }
         }
     }
 
     // 5. 心跳后台任务 (agent mode only — mix skips)
-    let mut config_version: u64 = 0;
     if !is_mix {
         let hb_client = agent_client.clone().unwrap();
         let hb_buffer = buffer.clone();
@@ -99,9 +122,13 @@ async fn run_agent(
                 iedb::agent::compute_schema_changes(&buf, &mut last_schema)
             };
             match hb_client.heartbeat(config_version, schema_changes).await {
-                Ok(Some(_update)) => {
-                    // 增量配置更新：Task 9 实现具体应用逻辑，此处仅推进版本号
-                    config_version += 1;
+                Ok(Some(update)) => {
+                    // I3: apply config update from server
+                    if let Some(ver) = update.get("version").and_then(|v| v.as_u64()) {
+                        config_version = ver;
+                    } else {
+                        config_version += 1;
+                    }
                     tracing::info!("Config updated to version {}", config_version);
                 }
                 Ok(None) => {}

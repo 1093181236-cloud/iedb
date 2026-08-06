@@ -70,7 +70,7 @@ pub async fn run_server(config: Arc<Config>, include_agent_api: bool) -> Result<
 
     // HTTP handlers
     let agent_api: Option<Arc<AgentApiHandler>> = if include_agent_api {
-        Some(Arc::new(AgentApiHandler { store: agent_store.clone() }))
+        Some(Arc::new(AgentApiHandler { store: agent_store.clone(), metadata: Some(metadata.clone()) }))
     } else {
         None
     };
