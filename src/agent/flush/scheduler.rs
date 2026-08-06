@@ -192,6 +192,7 @@ impl SnapshotScheduler {
                         table_name,
                         &parquet_data,
                         None,
+                        agent_id,
                     )
                     .await
                     {

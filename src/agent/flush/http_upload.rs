@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use tracing;
 
-/// Upload Parquet bytes to iotededb via HTTP.
+/// Upload Parquet bytes to iedb server via HTTP.
 pub async fn upload_parquet(
     client: &Client,
     iotededb_url: &str,
@@ -11,6 +11,7 @@ pub async fn upload_parquet(
     table: &str,
     data: &[u8],
     auth_header: Option<&str>,
+    agent_id: &str,
 ) -> Result<(), UploadError> {
     let url = format!(
         "{}/api/v1/ingest/parquet?db={}&measurement={}",
@@ -22,6 +23,7 @@ pub async fn upload_parquet(
     let mut req = client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
+        .header("x-agent-id", agent_id)
         .body(data.to_vec());
     if let Some(h) = auth_header {
         req = req.header("Authorization", h);

@@ -132,6 +132,16 @@ impl Chunk {
         // We know tag keys from the caller, not stored per-row.
         // The caller (Table) updates the index after adjusting schema.
 
+        // I10: update estimated row size for memory-limit protection
+        let row_bytes = 8  // time (i64)
+            + row.tag_values.iter().map(|t| t.len()).sum::<usize>()
+            + row.field_values.len() * 16;  // field overhead estimate
+        self.avg_row_bytes = if self.avg_row_bytes == 0 {
+            row_bytes
+        } else {
+            (self.avg_row_bytes + row_bytes) / 2
+        };
+
         self.rows.push(row);
     }
 

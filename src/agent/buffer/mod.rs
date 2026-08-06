@@ -149,7 +149,6 @@ mod tests {
         // Create a table with a chunk and insert rows
         let table = buffer.get_or_create_table("db1", "metrics");
         let chunk = table.get_or_create_chunk(0);
-        chunk.avg_row_bytes = 128;
 
         for i in 0..10 {
             let row = Row {
@@ -162,8 +161,9 @@ mod tests {
 
         let size = buffer.total_estimated_size();
         assert!(size > 0, "size should be > 0, got {size}");
-        // 10 rows, avg_row_bytes=128, so estimated >= max(avg_row_bytes, 64) * 10 = 128 * 10 = 1280
-        assert!(size >= 1280);
+        // 10 rows, avg_row_bytes dynamically computed from insert()
+        // time(8) + "srv01"(5) + 1*16 ≈ 29, then rolling avg → ~29, max(29,64)=64 per row
+        assert!(size >= 640);
     }
 
     #[test]
@@ -174,7 +174,6 @@ mod tests {
         {
             let table = buffer.get_or_create_table("db1", "metrics");
             let chunk = table.get_or_create_chunk(0);
-            chunk.avg_row_bytes = 200;
 
             let row = Row {
                 time: 100,
