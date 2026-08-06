@@ -221,7 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "server" => {
             let config = Arc::new(iedb::config::Config::from_file(&cli.config)?);
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(iedb::server::run_server(config))
+            rt.block_on(iedb::server::run_server(config, true))
         }
 
         #[cfg(all(feature = "agent", feature = "server"))]
@@ -297,7 +297,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rt.block_on(async {
                 tokio::select! {
                     r = run_agent(Arc::new(agent_config), Some(on_local_flush)) => r,
-                    r = iedb::server::run_server(server_config) => r,
+                    r = iedb::server::run_server(server_config, false) => r,
                 }
             })
         }

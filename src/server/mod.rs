@@ -26,11 +26,12 @@ use crate::server::query_engine::QueryEngine;
 use crate::server::sql_api::SqlApiHandler;
 use crate::server::table_provider::TableProvider;
 use hyper::service::service_fn;
+use hyper::Response;
 use std::sync::Arc;
 
 /// Server mode 入口：SQLite 元数据 → 存储层 → DataFusion 查询引擎 →
 /// Parquet 表注册 → Compaction 后台任务 → HTTP API 服务。
-pub async fn run_server(config: Arc<Config>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_server(config: Arc<Config>, include_agent_api: bool) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = &config.data.dir;
     std::fs::create_dir_all(data_dir)?;
 
@@ -68,9 +69,11 @@ pub async fn run_server(config: Arc<Config>) -> Result<(), Box<dyn std::error::E
     }
 
     // HTTP handlers
-    let agent_api = Arc::new(AgentApiHandler {
-        store: agent_store.clone(),
-    });
+    let agent_api: Option<Arc<AgentApiHandler>> = if include_agent_api {
+        Some(Arc::new(AgentApiHandler { store: agent_store.clone() }))
+    } else {
+        None
+    };
     let ingest_api = Arc::new(IngestApiHandler {
         data_dir: query_cfg.data_dir.clone(),
         metadata: metadata.clone(),
@@ -104,7 +107,14 @@ pub async fn run_server(config: Arc<Config>) -> Result<(), Box<dyn std::error::E
                 async move {
                     let path = req.uri().path().to_string();
                     match (req.method(), path.as_str()) {
-                        (_, p) if p.starts_with("/api/v1/agents") => agent.handle(req).await,
+                        (_, p) if p.starts_with("/api/v1/agents") => {
+                            if let Some(ref a) = agent {
+                                a.handle(req).await
+                            } else {
+                                Ok(Response::builder().status(404)
+                                    .body(r#"{"error":"not found","code":"NOT_FOUND"}"#.into()).unwrap())
+                            }
+                        }
                         (_, "/api/v1/ingest/parquet") => ingest.handle(req).await,
                         (_, "/api/v1/query") => sql.handle(req).await,
                         (_, p) if p.starts_with("/api/v1/metadata") => metadata.handle(req).await,
