@@ -85,16 +85,16 @@ impl AgentApiHandler {
         let id = req_data["id"].as_str().unwrap_or("");
         let config_version = req_data["config_version"].as_u64().unwrap_or(0);
 
-        // AgentStore::heartbeat only fails on SQL errors, so verify existence first
-        // (an UPDATE affecting 0 rows does not error for unknown agents).
-        if self.store.get(id).await.is_err() {
-            return Ok(json_response(
-                404,
-                &format!(r#"{{"error":"agent {} not found","code":"NOT_FOUND"}}"#, id),
-            ));
-        }
-        if let Err(e) = self.store.heartbeat(id, config_version).await {
-            return Ok(json_response(500, &format!(r#"{{"error":"{}","code":"INTERNAL"}}"#, e)));
+        // Try heartbeat — returns false if agent not found
+        match self.store.heartbeat(id, config_version).await {
+            Ok(true) => {}  // agent exists, heartbeat updated
+            Ok(false) => {
+                return Ok(json_response(404,
+                    &format!(r#"{{"error":"agent {} not found","code":"NOT_FOUND"}}"#, id)));
+            }
+            Err(e) => {
+                return Ok(json_response(500, &format!(r#"{{"error":"{}","code":"INTERNAL"}}"#, e)));
+            }
         }
 
         // I4: extract and forward schema_changes to metadata store

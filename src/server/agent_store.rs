@@ -45,15 +45,16 @@ impl AgentStore {
         self.get(id).await
     }
 
-    pub async fn heartbeat(&self, id: &str, config_version: u64) -> Result<(), String> {
+    /// Returns Ok(true) if agent existed, Ok(false) if not found.
+    pub async fn heartbeat(&self, id: &str, config_version: u64) -> Result<bool, String> {
         let conn = self.db.conn().lock().await;
         let now_ms = chrono::Utc::now().timestamp_millis();
-        conn.execute(
+        let affected = conn.execute(
             "UPDATE agents SET last_seen_at=?1, config_version=MAX(config_version, ?2) WHERE id=?3",
             params![now_ms, config_version as i64, id],
         )
         .map_err(|e| format!("heartbeat: {}", e))?;
-        Ok(())
+        Ok(affected > 0)
     }
 
     pub async fn get(&self, id: &str) -> Result<AgentRecord, String> {
