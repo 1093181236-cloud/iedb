@@ -225,6 +225,113 @@ sleep 10
 check_ok "$(curl -sf -X POST "http://127.0.0.1:18080/api/v1/query" -H "Content-Type: application/json" -d '{"sql":"SELECT * FROM bigdb.big"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['truncated'])")" "truncation: >100 rows"
 
 # ═══════════════════════════════════════════
+# ── 16. SQL with WHERE/time filter ──
+info "16. SQL filters"
+F=$(curl -sf -X POST "http://127.0.0.1:18080/api/v1/query" -H "Content-Type: application/json" \
+  -d '{"sql":"SELECT * FROM mydb.cpu WHERE host='"'"'srv01'"'"' ORDER BY time"}')
+check_eq "$(echo "$F" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['rows']))")" "2" "SQL WHERE host=srv01"
+TIME_Q=$(curl -sf -X POST "http://127.0.0.1:18080/api/v1/query" -H "Content-Type: application/json" \
+  -d '{"sql":"SELECT * FROM mydb.cpu WHERE time >= '"$OLD_TS"' AND time < '"$((OLD_TS+2000000000))"' ORDER BY time"}')
+check_ge "$(echo "$TIME_Q" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['rows']))")" "1" "SQL time range filter"
+
+# ── 17. Agent offline detection ──
+info "17. Agent offline detection"
+kill $AGENT_PID 2>/dev/null; wait $AGENT_PID 2>/dev/null || true
+sleep 12  # heartbeat_timeout is 10s
+AGENTS3=$(curl -sf "http://127.0.0.1:18080/api/v1/agents")
+check_eq "$(echo "$AGENTS3" | python3 -c "import sys,json; a=json.load(sys.stdin)['agents']; print(a[0]['status'])")" "offline" "agent detected offline after kill"
+
+# ── 18. Second agent writes same table ──
+info "18. Multiple agents, same table"
+# Start agent-02
+cat > "$TMP/agent2.toml" << EOF2
+[server]
+port = 18082
+max_body_bytes = 102400
+
+[data]
+dir = "$TMP/agent2-data"
+
+[agent]
+id = "edge-02"
+server_url = "http://127.0.0.1:18080"
+
+[wal]
+flush_interval_secs = 1
+max_write_buffer_ops = 100000
+
+[flush]
+snapshot_interval = "2s"
+backend = "http"
+memory_limit = "512MB"
+EOF2
+mkdir -p "$TMP/agent2-data"
+"$BIN" --mode agent --config "$TMP/agent2.toml" & AGENT2_PID=$!; sleep 3
+# Write from agent-02 to the same table
+curl -s -o /dev/null -X POST "http://127.0.0.1:18082/write?db=mydb" \
+  -d "cpu,host=srv03 cpu=99.9,mem=10.0 $((OLD_TS + 3000000000))"
+sleep 10
+SQL2=$(curl -sf -X POST "http://127.0.0.1:18080/api/v1/query" -H "Content-Type: application/json" \
+  -d '{"sql":"SELECT host, COUNT(*) AS cnt FROM mydb.cpu GROUP BY host ORDER BY host"}')
+check_eq "$(echo "$SQL2" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['rows']))")" "3" "3 hosts from 2 agents"
+TD3=$(curl -sf "http://127.0.0.1:18080/api/v1/metadata/table?db=mydb&table=cpu")
+check_ok "$(echo "$TD3" | python3 -c "import sys,json; d=json.load(sys.stdin); print('edge-02' in d['sources'])")" "source includes edge-02"
+kill $AGENT2_PID 2>/dev/null; wait $AGENT2_PID 2>/dev/null || true
+
+# ── 19. Direct ingest API ──
+info "19. Direct ingest API"
+# Build a tiny parquet from scratch using the binary's own query engine
+# (We already have parquet files from agent uploads — reuse one)
+SAMPLE=$(find "$TMP/server-data" -name "*.parquet" 2>/dev/null | head -1)
+if [ -n "$SAMPLE" ]; then
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    "http://127.0.0.1:18080/api/v1/ingest/parquet?db=ingestdb&measurement=direct" \
+    -H "Content-Type: application/octet-stream" \
+    -H "x-agent-id: test-script" \
+    --data-binary "@$SAMPLE")
+  check_eq "$CODE" "200" "direct ingest: 200"
+  # Verify metadata picks it up
+  I_DBS=$(curl -sf "http://127.0.0.1:18080/api/v1/metadata/databases")
+  check_ok "$(echo "$I_DBS" | python3 -c "import sys,json; dbs=[d['name'] for d in json.load(sys.stdin)['databases']]; print('ingestdb' in dbs)")" "ingestdb appears in databases"
+fi
+
+# ── 20. WAL recovery after crash ──
+info "20. WAL recovery"
+# Start fresh agent, write data, kill -9 (no clean shutdown), restart, verify
+cat > "$TMP/wal-agent.toml" << EOF3
+[server]
+port = 18083
+
+[data]
+dir = "$TMP/wal-data"
+
+[agent]
+id = "wal-test"
+server_url = "http://127.0.0.1:18080"
+
+[wal]
+flush_interval_secs = 5
+max_write_buffer_ops = 100000
+
+[flush]
+snapshot_interval = "60s"
+backend = "http"
+memory_limit = "512MB"
+EOF3
+mkdir -p "$TMP/wal-data"
+"$BIN" --mode agent --config "$TMP/wal-agent.toml" & WAL_PID=$!; sleep 2
+# Write data, kill before WAL flush (5s interval, we wait 2s)
+WAL_TS=$(( ($(date +%s) - 3600) * 1000000000 ))
+curl -s -o /dev/null -X POST "http://127.0.0.1:18083/write?db=waldb" \
+  -d "test,src=crash value=42.0 $WAL_TS"
+sleep 1
+kill -9 $WAL_PID 2>/dev/null; wait $WAL_PID 2>/dev/null || true
+# Restart same agent — WAL replay should recover the data
+"$BIN" --mode agent --config "$TMP/wal-agent.toml" & WAL_PID=$!; sleep 3
+BUF=$(curl -sf "http://127.0.0.1:18083/query?db=waldb&table=test")
+check_eq "$(echo "$BUF" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['rows']))")" "1" "WAL recovery: 1 row after crash"
+kill $WAL_PID 2>/dev/null; wait $WAL_PID 2>/dev/null || true
+
 echo ""
 echo "========================================="
 echo -e "  ${GREEN}C/S pipeline: $S/$TOTAL passed${NC}"

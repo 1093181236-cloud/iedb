@@ -155,6 +155,32 @@ check_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST 'http://127.0.0.1:180
 info "12. No agent management in mix"
 check_eq "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:18080/api/v1/agents')" "404" "404: /agents not in mix"
 
+# ── 13. SQL WHERE/time filter ──
+info "13. SQL filters"
+F=$(curl -sf -X POST "http://127.0.0.1:18080/api/v1/query" -H "Content-Type: application/json" \
+  -d '{"sql":"SELECT * FROM mydb.cpu WHERE host='"'"'srv01'"'"' ORDER BY time"}')
+check_eq "$(echo "$F" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['rows']))")" "2" "SQL WHERE host=srv01"
+
+# ── 14. Write query params ──
+info "14. Write with default db"
+curl -s -o /dev/null -X POST "http://127.0.0.1:18081/write" \
+  -d "nodef,src=x val=1.0 $OLD_TS"
+sleep 12
+# Should be queryable as "default" database
+ND=$(curl -sf "http://127.0.0.1:18080/api/v1/metadata/databases")
+check_ok "$(echo "$ND" | python3 -c "import sys,json; dbs=[d['name'] for d in json.load(sys.stdin)['databases']]; print('default' in dbs)")" "default db from paramless write"
+
+# ── 15. Ingestion query params ──
+info "15. Ingest with query params"
+SAMPLE=$(find "$TMP/data" -name "*.parquet" 2>/dev/null | head -1)
+if [ -n "$SAMPLE" ]; then
+  check_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    'http://127.0.0.1:18080/api/v1/ingest/parquet?db=ingestdb&measurement=direct' \
+    -H 'Content-Type: application/octet-stream' \
+    -H 'x-agent-id: mix-test' \
+    --data-binary "@$SAMPLE")" "200" "ingest via query params"
+fi
+
 echo ""
 echo "========================================="
 echo -e "  ${GREEN}Mix pipeline: $S/$TOTAL passed${NC}"
