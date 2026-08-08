@@ -135,6 +135,15 @@ pub async fn run_server(config: Arc<Config>, include_agent_api: bool) -> Result<
                         (_, "/api/v1/ingest/parquet") => ingest.handle(req).await,
                         (_, "/api/v1/query") => sql.handle(req).await,
                         (_, p) if p.starts_with("/api/v1/metadata") => metadata.handle(req).await,
+                        (_, "/") => {
+                            if let Some((body, mime)) = crate::frontend::serve(&path) {
+                                Ok(hyper::Response::builder().status(200)
+                                    .header("Content-Type", mime).body(body).unwrap())
+                            } else {
+                                Ok(hyper::Response::builder().status(404)
+                                    .body("not found".into()).unwrap())
+                            }
+                        }
                         (_, "/health") => Ok(hyper::Response::new("ok".into())),
                         _ => Ok(hyper::Response::builder()
                             .status(404)

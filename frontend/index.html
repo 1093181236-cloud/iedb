@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>iedb Console</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font:14px/1.5 system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;height:100vh}
+nav{width:180px;background:#1e293b;padding:12px 0;display:flex;flex-direction:column}
+nav a{color:#94a3b8;text-decoration:none;padding:10px 20px;display:block;font-size:13px;border-left:3px solid transparent}
+nav a:hover,nav a.active{color:#e2e8f0;background:#0f172a;border-left-color:#38bdf8}
+main{flex:1;overflow-y:auto;padding:24px}
+h2{font-size:18px;margin-bottom:16px;color:#f1f5f9}
+.card{background:#1e293b;border-radius:8px;padding:16px;margin-bottom:16px}
+.status{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.status.online{background:#22c55e}
+.status.offline{background:#6b7280}
+.status.unknown{background:#f59e0b}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid #334155;font-size:13px}
+th{color:#94a3b8;font-weight:500}
+.btn{padding:6px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px}
+.btn-primary{background:#38bdf8;color:#0f172a}
+.btn-danger{background:#ef4444;color:#fff}
+.btn-sm{padding:4px 10px;font-size:12px}
+input,textarea,select{width:100%;padding:8px 12px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font:inherit;resize:vertical}
+textarea{min-height:80px;font-family:monospace}
+label{display:block;margin-bottom:4px;color:#94a3b8;font-size:13px}
+.form-group{margin-bottom:12px}
+.flex{display:flex;gap:12px}
+.grow{flex:1}
+.meta-tree{font-size:13px}
+.meta-tree ul{list-style:none;padding-left:16px}
+.meta-tree li{cursor:pointer;padding:4px 0;color:#94a3b8}
+.meta-tree li:hover{color:#e2e8f0}
+.meta-tree .db{font-weight:600;color:#38bdf8}
+.result-table{max-height:400px;overflow:auto}
+.tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;background:#334155;margin-right:4px}
+.toast{position:fixed;top:12px;right:12px;padding:10px 20px;border-radius:6px;color:#fff;font-size:13px;z-index:99}
+.toast.error{background:#ef4444}
+.toast.success{background:#22c55e}
+</style>
+</head>
+<body>
+<nav>
+  <a href="#agents" class="active" data-tab="agents">Agents</a>
+  <a href="#metadata" data-tab="metadata">Metadata</a>
+  <a href="#sql" data-tab="sql">SQL Console</a>
+</nav>
+<main id="main"></main>
+
+<script>
+const API = '';
+
+function $(sel){return document.querySelector(sel)}
+function $$(sel){return document.querySelectorAll(sel)}
+
+// ── Routing ──
+const pages = { agents, metadata, sql };
+$$('nav a').forEach(a => a.onclick = e => { e.preventDefault(); route(a.dataset.tab) });
+window.onhashchange = () => route(location.hash.slice(1)||'agents');
+function route(tab){
+  $$('nav a').forEach(a => a.classList.toggle('active', a.dataset.tab===tab));
+  location.hash = tab;
+  pages[tab]();
+}
+
+// ── Helpers ──
+async function api(path, opts={}){
+  const res = await fetch(API+path, {headers:{'Content-Type':'application/json'},...opts});
+  if(!res.ok){ const err=await res.json().catch(()=>({error:res.statusText})); throw new Error(err.error||res.statusText) }
+  return res.json();
+}
+function toast(msg,type='success'){
+  const t=document.createElement('div'); t.className='toast '+type; t.textContent=msg;
+  document.body.appendChild(t); setTimeout(()=>t.remove(),3000);
+}
+function fmtTime(ms){
+  if(!ms)return '-';
+  if(ms>1e15) return new Date(ms/1e6).toISOString().replace('T',' ').slice(0,19);
+  return new Date(ms).toISOString().replace('T',' ').slice(0,19);
+}
+
+// ── Agents ──
+async function agents(){
+  const data = await api('/api/v1/agents');
+  let rows = data.agents.map(a => `
+    <tr>
+      <td><span class="status ${a.status}"></span>${a.id}</td>
+      <td>${a.hostname}</td>
+      <td>${a.status}</td>
+      <td>${fmtTime(a.last_seen)}</td>
+      <td>
+        <button class="btn btn-primary btn-sm" onclick="showAgentDetail('${a.id}')">Detail</button>
+        <button class="btn btn-sm" style="background:#f59e0b;color:#000" onclick="editAgentConfig('${a.id}')">Config</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteAgent('${a.id}')">Del</button>
+      </td>
+    </tr>
+  `).join('');
+  render('Agents', `<div class="card"><table><thead><tr><th>ID</th><th>Hostname</th><th>Status</th><th>Last Seen</th><th style="width:220px">Actions</th></tr></thead><tbody>${rows||'<tr><td colspan=5>No agents registered</td></tr>'}</tbody></table></div><div id="agent-detail"></div>`);
+}
+
+async function showAgentDetail(id){
+  const a = await api('/api/v1/agents/'+id);
+  $('#agent-detail').innerHTML = `<div class="card">
+    <h2>${a.id}</h2>
+    <p>Hostname: ${a.hostname} | Arch: ${a.arch||'-'} | Version: ${a.version||'-'}</p>
+    <p>Config Version: ${a.config_version} | Target: ${a.target_config_version}</p>
+    <p>Registered: ${fmtTime(a.registered_at)} | Last Seen: ${fmtTime(a.last_seen)}</p>
+    <pre style="background:#0f172a;padding:12px;border-radius:6px;margin-top:8px;overflow:auto">${JSON.stringify(a.config_json?JSON.parse(a.config_json):'none',null,2)}</pre>
+  </div>`;
+}
+
+async function editAgentConfig(id){
+  const current = prompt('Enter new config JSON (e.g. {"flush":{"memory_limit":"128MB"}}):');
+  if(!current) return;
+  await api('/api/v1/agents/'+id+'/config', {method:'PUT', body:current});
+  toast('Config updated');
+}
+
+async function deleteAgent(id){
+  if(!confirm('Delete agent '+id+'?')) return;
+  await api('/api/v1/agents/'+id, {method:'DELETE'});
+  toast('Agent deleted');
+  agents();
+}
+
+// ── Metadata ──
+async function metadata(){
+  const dbs = await api('/api/v1/metadata/databases');
+  if(!dbs.databases.length){ render('Metadata','<div class="card">No databases yet</div>'); return; }
+
+  let tree = '<ul>';
+  for(const db of dbs.databases){
+    tree += `<li class="db">📁 ${db.name}<ul>`;
+    const tables = await api(`/api/v1/metadata/tables?db=${encodeURIComponent(db.name)}`);
+    for(const t of tables.tables||[]){
+      tree += `<li onclick="showTableDetail('${db.name}','${t.name}')">📊 ${t.name} <span style="color:#94a3b8;font-size:11px">${t.row_count} rows</span></li>`;
+    }
+    tree += '</ul></li>';
+  }
+  tree += '</ul>';
+  render('Metadata', `<div class="card meta-tree">${tree}</div><div id="table-detail"></div>`);
+}
+
+async function showTableDetail(db, table){
+  const d = await api(`/api/v1/metadata/table?db=${encodeURIComponent(db)}&table=${encodeURIComponent(table)}`);
+  $('#table-detail').innerHTML = `<div class="card">
+    <h2>${db}.${table}</h2>
+    <p>Rows: ${d.row_count} | Time: ${fmtTime(d.time_min)} ~ ${fmtTime(d.time_max)} | Sources: ${(d.sources||[]).join(', ')}</p>
+    <p>Tag keys: ${(d.tag_keys||[]).map(k=>'<span class="tag">'+k+'</span>').join('')||'none'}</p>
+    <table><thead><tr><th>Field</th><th>Type</th></tr></thead><tbody>${(d.fields||[]).map(f=>`<tr><td>${f.name}</td><td>${f.type}</td></tr>`).join('')}</tbody></table>
+  </div>`;
+}
+
+// ── SQL Console ──
+function sql(){
+  render('SQL Console', `<div class="card">
+    <div class="form-group"><textarea id="sql-editor" placeholder="SELECT * FROM mydb.cpu ORDER BY time LIMIT 10"></textarea></div>
+    <button class="btn btn-primary" onclick="runSQL()">Run</button>
+    <div id="sql-result" style="margin-top:16px"></div>
+  </div>`);
+}
+async function runSQL(){
+  const sql = $('#sql-editor').value;
+  if(!sql) return;
+  try{
+    const data = await api('/api/v1/query', {method:'POST', body:JSON.stringify({sql})});
+    let html = `<p style="margin-bottom:8px">${data.returned_rows} rows ${data.truncated?'(truncated)':''}</p>`;
+    if(data.rows.length){
+      const cols = Object.keys(data.rows[0]);
+      html += '<div class="result-table"><table><thead><tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr></thead><tbody>';
+      for(const r of data.rows) html += '<tr>'+cols.map(c=>`<td>${r[c]??'NULL'}</td>`).join('')+'</tr>';
+      html += '</tbody></table></div>';
+    }
+    $('#sql-result').innerHTML = html;
+  }catch(e){ $('#sql-result').innerHTML=`<div class="card" style="color:#f87171">${e.message}</div>` }
+}
+
+// ── Render ──
+function render(title, body){ $('#main').innerHTML=`<h2>${title}</h2>${body}` }
+
+// ── Init ──
+route(location.hash.slice(1)||'agents');
+</script>
+</body>
+</html>
