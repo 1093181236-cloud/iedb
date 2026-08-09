@@ -13,14 +13,15 @@ pub struct CompactionScheduler {
 }
 
 impl CompactionScheduler {
-    /// 后台循环：先休眠再触发（间隔固定为 6 小时，与默认 schedule
-    /// "0 */6 * * *" 一致；完整 cron 解析留待后续）。
+    /// 后台循环：从 schedule 解析间隔（cron 格式 "0 */N * * *"，提取 N 小时）
     pub async fn run(&self) {
         if !self.config.enabled {
             return;
         }
 
-        let interval = tokio::time::Duration::from_secs(6 * 3600);
+        let hours = parse_schedule_hours(&self.config.schedule);
+        let interval = tokio::time::Duration::from_secs((hours * 3600) as u64);
+        tracing::info!("Compaction scheduler: every {}h", hours);
         loop {
             tokio::time::sleep(interval).await;
             if let Err(e) = self.run_once().await {
@@ -132,8 +133,31 @@ impl CompactionScheduler {
     }
 }
 
+/// Parse cron-like "0 */N * * *" to extract N hours. Falls back to 6.
+fn parse_schedule_hours(schedule: &str) -> u64 {
+    for part in schedule.split_whitespace() {
+        if part.starts_with("*/") {
+            return part[2..].parse::<u64>().unwrap_or(6);
+        }
+    }
+    6
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_schedule() {
+        assert_eq!(parse_schedule_hours("0 */6 * * *"), 6);
+        assert_eq!(parse_schedule_hours("0 */1 * * *"), 1);
+        assert_eq!(parse_schedule_hours("0 */12 * * *"), 12);
+        assert_eq!(parse_schedule_hours("bad"), 6);
+    }
+}
+
+#[cfg(test)]
+mod tests_compaction {
     use super::*;
     use crate::server::db::Db;
     use crate::server::test_util::write_test_parquet;
