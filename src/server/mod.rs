@@ -136,7 +136,7 @@ pub async fn run_server(config: Arc<Config>, include_agent_api: bool) -> Result<
                         (_, "/api/v1/query") => sql.handle(req).await,
                         (_, p) if p.starts_with("/api/v1/metadata") => metadata.handle(req).await,
                         (_, "/") => {
-                            if let Some((body, mime)) = crate::frontend::serve(&path) {
+                            if let Some((body, mime)) = crate::frontend::serve("index.html", &path) {
                                 Ok(hyper::Response::builder().status(200)
                                     .header("Content-Type", mime).body(body).unwrap())
                             } else {

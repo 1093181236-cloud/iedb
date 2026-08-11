@@ -7,7 +7,7 @@ pub mod agent;
 
 #[cfg(feature = "server")]
 pub mod server;
-#[cfg(feature = "server")]
+#[cfg(any(feature = "agent", feature = "server"))]
 pub mod frontend;
 
 pub mod storage;
