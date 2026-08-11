@@ -28,7 +28,8 @@ impl Db {
                 config_version INTEGER DEFAULT 1,
                 target_config_version INTEGER DEFAULT 1,
                 registered_at INTEGER NOT NULL,
-                last_seen_at INTEGER
+                last_seen_at INTEGER,
+                listen_addr TEXT
             );
 
             CREATE TABLE IF NOT EXISTS databases (
@@ -61,6 +62,15 @@ impl Db {
                 PRIMARY KEY (agent_id, table_id)
             );
         ")?;
+
+        // Migration: add listen_addr column if it doesn't exist (for DBs created before this feature)
+        let has_col: bool = conn
+            .prepare("SELECT listen_addr FROM agents LIMIT 0")
+            .is_ok();
+        if !has_col {
+            conn.execute_batch("ALTER TABLE agents ADD COLUMN listen_addr TEXT;")?;
+        }
+
         Ok(())
     }
 
