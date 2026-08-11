@@ -44,17 +44,7 @@ async fn run_agent(
     std::fs::create_dir_all(data_dir.join("meta"))?;
     std::fs::create_dir_all(data_dir.join("staging"))?;
 
-    // 2. 初始化 Buffer + WAL
-    let buffer = Arc::new(Mutex::new(Buffer::new()));
-    let wal_manager = Arc::new(Mutex::new(WalManager::new(&data_dir, &config.wal).await?));
-    wal_manager.lock().await.replay(&buffer).await?;
-
-    // 3. HTTP client（供快照上传用）
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    // 4. 关闭信号
+    // 4. 关闭信号 (created early; used by the system sampler below)
     let shutdown_signal = Arc::new(Notify::new());
     let ctrl_shutdown = shutdown_signal.clone();
     tokio::spawn(async move {
@@ -65,9 +55,34 @@ async fn run_agent(
         ctrl_shutdown.notify_waiters();
     });
 
+    // System resource sampler (CPU/memory for status endpoint)
+    let system_sampler = Arc::new(iedb::agent::system::SystemSampler::new());
+    let sys_sampler_bg = system_sampler.clone();
+    let sys_shutdown = shutdown_signal.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            tokio::select! {
+                _ = sys_shutdown.notified() => break,
+                _ = interval.tick() => {}
+            }
+            sys_sampler_bg.tick().await;
+        }
+    });
+
+    // 2. 初始化 Buffer + WAL
+    let buffer = Arc::new(Mutex::new(Buffer::new()));
+    let wal_manager = Arc::new(Mutex::new(WalManager::new(&data_dir, &config.wal).await?));
+    wal_manager.lock().await.replay(&buffer).await?;
+
+    // 3. HTTP client（供快照上传用）
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
     // In mix mode (_on_local_flush is Some), skip remote registration/heartbeat
     let is_mix = _on_local_flush.is_some();
-    let listen_addr = format!("0.0.0.0:{}", config.server.port);
+    let listen_addr = format!("{}:{}", gethostname::gethostname().to_string_lossy(), config.server.port);
     let agent_client = if is_mix { None } else { Some(Arc::new(AgentClient::new(config.clone(), listen_addr))) };
 
     let mut config_version: u64 = 0;
@@ -184,11 +199,13 @@ async fn run_agent(
         snapshot_scheduler.on_local_flush = Some(cb);
         tracing::info!("Mix mode: local flush callback installed");
     }
+    let snapshot_scheduler = Arc::new(snapshot_scheduler);
     let snap_shutdown = shutdown_signal.clone();
+    let snap_sched = snapshot_scheduler.clone();
     tokio::spawn(async move {
         tokio::select! {
             _ = snap_shutdown.notified() => {}
-            _ = snapshot_scheduler.run() => {}
+            _ = snap_sched.run() => {}
         }
     });
 
@@ -200,6 +217,15 @@ async fn run_agent(
     });
     let query_handler = Arc::new(QueryHandler {
         buffer: buffer.clone(),
+    });
+    let status_handler = Arc::new(iedb::agent::status::StatusHandler {
+        buffer: buffer.clone(),
+        wal: wal_manager.clone(),
+        snapshot: snapshot_scheduler.clone(),
+        system: system_sampler.clone(),
+        agent_client: agent_client.clone(),
+        config: config.clone(),
+        started_at: std::time::Instant::now(),
     });
 
     let addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.server.port).parse()?;
@@ -215,15 +241,33 @@ async fn run_agent(
                 let io = TokioIo::new(stream);
                 let write_handler = write_handler.clone();
                 let query_handler = query_handler.clone();
+                let status_handler = status_handler.clone();
                 tokio::spawn(async move {
                     let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
                         let w = write_handler.clone();
                         let q = query_handler.clone();
+                        let s = status_handler.clone();
                         async move {
                             match (req.method(), req.uri().path()) {
                                 (&Method::POST, "/write") => w.handle(req).await,
                                 (&Method::GET, "/query") => q.handle(req).await,
+                                (&Method::GET, "/api/v1/status") => {
+                                    let s = s.clone();
+                                    s.handle(req).await
+                                }
                                 (&Method::GET, "/health") => Ok(Response::new("ok".into())),
+                                (&Method::GET, p) if p == "/" || p.ends_with(".html") || p.ends_with(".js") || p.ends_with(".css") => {
+                                    let path = req.uri().path().to_string();
+                                    if let Some((body, mime)) = iedb::frontend::serve("agent.html", &path) {
+                                        Ok(hyper::Response::builder().status(200)
+                                            .header("Content-Type", mime).body(body).unwrap())
+                                    } else {
+                                        Ok(hyper::Response::builder()
+                                            .status(StatusCode::NOT_FOUND)
+                                            .body("not found".into())
+                                            .unwrap())
+                                    }
+                                }
                                 _ => Ok(Response::builder()
                                     .status(StatusCode::NOT_FOUND)
                                     .body("not found".into())
