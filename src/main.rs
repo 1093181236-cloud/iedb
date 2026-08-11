@@ -67,7 +67,8 @@ async fn run_agent(
 
     // In mix mode (_on_local_flush is Some), skip remote registration/heartbeat
     let is_mix = _on_local_flush.is_some();
-    let agent_client = if is_mix { None } else { Some(Arc::new(AgentClient::new(config.clone()))) };
+    let listen_addr = format!("0.0.0.0:{}", config.server.port);
+    let agent_client = if is_mix { None } else { Some(Arc::new(AgentClient::new(config.clone(), listen_addr))) };
 
     let mut config_version: u64 = 0;
     // I3: try loading cached config before registration (fallback if server unreachable)

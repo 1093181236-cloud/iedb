@@ -10,6 +10,7 @@ pub mod system;
 use crate::config::{AgentClientConfig, Config};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
@@ -18,6 +19,7 @@ struct RegisterRequest {
     pub version: String,
     pub hostname: String,
     pub arch: String,
+    pub listen_addr: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,16 +54,20 @@ struct HeartbeatResponse {
 pub struct AgentClient {
     pub config: Arc<Config>,
     pub client: Client,
+    pub listen_addr: String,
+    pub heartbeat_failures: AtomicU64,
 }
 
 impl AgentClient {
-    pub fn new(config: Arc<Config>) -> Self {
+    pub fn new(config: Arc<Config>, listen_addr: String) -> Self {
         AgentClient {
             config,
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to create HTTP client"),
+            listen_addr,
+            heartbeat_failures: AtomicU64::new(0),
         }
     }
 
@@ -76,6 +82,7 @@ impl AgentClient {
             version: env!("CARGO_PKG_VERSION").to_string(),
             hostname: gethostname::gethostname().to_string_lossy().to_string(),
             arch: std::env::consts::ARCH.to_string(),
+            listen_addr: self.listen_addr.clone(),
         };
         let url = format!("{}/api/v1/agents/register", agent_cfg.server_url);
         let resp = self
@@ -119,8 +126,10 @@ impl AgentClient {
             .await
             .map_err(|e| format!("heartbeat request: {}", e))?;
         if !resp.status().is_success() {
+            self.heartbeat_failures.fetch_add(1, Ordering::Relaxed);
             return Err(format!("heartbeat failed: {}", resp.status()));
         }
+        self.heartbeat_failures.store(0, Ordering::Relaxed);
         let body: HeartbeatResponse = resp
             .json()
             .await
@@ -271,7 +280,7 @@ mod tests {
             dir.path().display()
         );
         let config: crate::config::Config = toml::from_str(&toml).unwrap();
-        let client = AgentClient::new(std::sync::Arc::new(config));
+        let client = AgentClient::new(std::sync::Arc::new(config), "127.0.0.1:8080".into());
 
         let err = client.register().await;
         assert!(err.is_err(), "register without [agent] config should fail");
