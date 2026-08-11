@@ -52,6 +52,11 @@ impl WalManager {
         self.current_seq
     }
 
+    /// Number of write ops buffered but not yet flushed to a WAL file.
+    pub fn pending_ops_count(&self) -> usize {
+        self.pending_ops.len()
+    }
+
     /// Buffer a write op. Returns `BufferFull` error if over limit.
     pub fn buffer_op(&mut self, op: WalOp) -> Result<(), WalError> {
         if self.op_count >= self.op_limit {
