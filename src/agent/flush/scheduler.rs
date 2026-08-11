@@ -13,6 +13,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing;
 
+/// Snapshot status exposed to the agent status endpoint.
+#[derive(Debug, Clone)]
+pub struct SnapshotStatus {
+    pub last_at: Option<i64>,       // Unix ms timestamp of last snapshot
+    pub upload_ok: bool,            // Whether last upload succeeded
+    pub last_size_bytes: u64,       // Size of last uploaded parquet
+    pub next_in_secs: i64,          // Seconds until next scheduled snapshot
+}
+
 /// Callback invoked after a parquet file is written locally (mix mode).
 /// Arguments: db_name, table_name, file_path, table_schema
 pub type LocalFlushCallback = dyn Fn(&str, &str, &Path, &Table) + Send + Sync;
@@ -24,6 +33,8 @@ pub struct SnapshotScheduler {
     pub client: Client,
     pub staging_dir: PathBuf,
     pub on_local_flush: Option<Arc<LocalFlushCallback>>,
+    last_snapshot: tokio::sync::Mutex<SnapshotStatus>,
+    started_at: std::time::Instant,
 }
 
 impl SnapshotScheduler {
@@ -34,6 +45,7 @@ impl SnapshotScheduler {
         client: Client,
     ) -> Self {
         let staging_dir = config.data.dir.join("staging");
+        let snapshot_interval_secs = config.snapshot_interval_secs();
         SnapshotScheduler {
             buffer,
             wal,
@@ -41,6 +53,13 @@ impl SnapshotScheduler {
             client,
             staging_dir,
             on_local_flush: None,
+            last_snapshot: tokio::sync::Mutex::new(SnapshotStatus {
+                last_at: None,
+                upload_ok: true,
+                last_size_bytes: 0,
+                next_in_secs: snapshot_interval_secs,
+            }),
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -85,6 +104,19 @@ impl SnapshotScheduler {
                 }
             }
         }
+    }
+
+    /// Return the last snapshot status (for the status API endpoint).
+    pub async fn last_snapshot_status(&self) -> SnapshotStatus {
+        let mut status = self.last_snapshot.lock().await.clone();
+        let elapsed = self.started_at.elapsed().as_secs() as i64;
+        let interval = self.config.snapshot_interval_secs();
+        // Approximate seconds until next scheduled snapshot
+        let since_last = status.last_at
+            .map(|ts| (chrono::Utc::now().timestamp_millis() - ts) / 1000)
+            .unwrap_or(elapsed);
+        status.next_in_secs = (interval - since_last % interval).max(0);
+        status
     }
 
     /// Execute one snapshot cycle.
@@ -207,6 +239,13 @@ impl SnapshotScheduler {
 
             match upload_result {
                 Ok(()) => {
+                    // Update status for monitoring
+                    {
+                        let mut status = self.last_snapshot.lock().await;
+                        status.last_at = Some(chrono::Utc::now().timestamp_millis());
+                        status.upload_ok = true;
+                        status.last_size_bytes = parquet_data.len() as u64;
+                    }
                     // C5 fix: remove chunks by chunk_time, not positional index
                     // I2 fix: track snapshot sequence for WAL cleanup
                     let snapshot_wal_seq = {
@@ -265,6 +304,12 @@ impl SnapshotScheduler {
                     flushed_count += 1;
                 }
                 Err(e) => {
+                    // Update status
+                    {
+                        let mut status = self.last_snapshot.lock().await;
+                        status.upload_ok = false;
+                        status.last_size_bytes = parquet_data.len() as u64;
+                    }
                     // Failure: save to staging
                     tracing::warn!(
                         db = %db_name,
