@@ -56,12 +56,13 @@ impl AgentApiHandler {
         let hostname = req_data["hostname"].as_str().unwrap_or("unknown");
         let arch = req_data["arch"].as_str().unwrap_or("unknown");
         let version = req_data["version"].as_str().unwrap_or("0.1.0");
+        let listen_addr = req_data["listen_addr"].as_str().unwrap_or("unknown");
 
         if id.is_empty() {
             return Ok(json_response(400, r#"{"error":"agent id required","code":"BAD_REQUEST"}"#));
         }
 
-        match self.store.register(id, hostname, arch, version).await {
+        match self.store.register(id, hostname, arch, version, listen_addr).await {
             Ok(agent) => {
                 let resp = serde_json::json!({
                     "agent_id": agent.id,
@@ -149,6 +150,7 @@ impl AgentApiHandler {
                         "last_seen": a.last_seen_at.map(ms_to_iso8601),
                         "config_version": a.config_version,
                         "target_config_version": a.target_config_version,
+                        "listen_addr": a.listen_addr,
                     })
                 }).collect();
                 Ok(json_response(200, &serde_json::json!({"agents": result}).to_string()))
@@ -235,7 +237,7 @@ mod tests {
         let (_dir, h) = test_handler();
 
         let resp = h.handle(json_req("POST", "/api/v1/agents/register",
-            r#"{"id":"agent-01","hostname":"edge-01","arch":"armv7","version":"0.1.0"}"#)).await.unwrap();
+            r#"{"id":"agent-01","hostname":"edge-01","arch":"armv7","version":"0.1.0","listen_addr":"192.168.0.230:18080"}"#)).await.unwrap();
         assert_eq!(resp.status().as_u16(), 200);
         let v: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
         assert_eq!(v["agent_id"], "agent-01");
@@ -262,8 +264,8 @@ mod tests {
     async fn test_list_and_heartbeat() {
         let (_dir, h) = test_handler();
 
-        h.handle(json_req("POST", "/api/v1/agents/register", r#"{"id":"a1","hostname":"h1"}"#)).await.unwrap();
-        h.handle(json_req("POST", "/api/v1/agents/register", r#"{"id":"a2","hostname":"h2"}"#)).await.unwrap();
+        h.handle(json_req("POST", "/api/v1/agents/register", r#"{"id":"a1","hostname":"h1","listen_addr":"10.0.0.1:8080"}"#)).await.unwrap();
+        h.handle(json_req("POST", "/api/v1/agents/register", r#"{"id":"a2","hostname":"h2","listen_addr":"10.0.0.2:8080"}"#)).await.unwrap();
 
         // 刚注册 → online/unknown
         let resp = h.handle(json_req("GET", "/api/v1/agents", "")).await.unwrap();
@@ -288,7 +290,7 @@ mod tests {
     async fn test_update_config_then_heartbeat_picks_it_up() {
         let (_dir, h) = test_handler();
 
-        h.handle(json_req("POST", "/api/v1/agents/register", r#"{"id":"a1","hostname":"h1"}"#)).await.unwrap();
+        h.handle(json_req("POST", "/api/v1/agents/register", r#"{"id":"a1","hostname":"h1","listen_addr":"10.0.0.1:8080"}"#)).await.unwrap();
 
         // 推送配置 → target_version 递增
         let resp = h.handle(json_req("PUT", "/api/v1/agents/a1/config", r#"{"batch":1024}"#)).await.unwrap();

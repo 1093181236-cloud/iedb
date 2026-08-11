@@ -15,6 +15,7 @@ pub struct AgentRecord {
     pub target_config_version: i64,
     pub registered_at: i64,
     pub last_seen_at: Option<i64>,
+    pub listen_addr: Option<String>,
 }
 
 #[derive(Clone)]
@@ -27,18 +28,19 @@ impl AgentStore {
         AgentStore { db }
     }
 
-    pub async fn register(&self, id: &str, hostname: &str, arch: &str, version: &str) -> Result<AgentRecord, String> {
+    pub async fn register(&self, id: &str, hostname: &str, arch: &str, version: &str, listen_addr: &str) -> Result<AgentRecord, String> {
         {
             let conn = self.db.conn().lock().await;
             let now_ms = chrono::Utc::now().timestamp_millis();
             // 尝试 INSERT，冲突则 UPDATE（重复注册 = 重启）
             conn.execute(
-                "INSERT INTO agents (id, hostname, arch, version, registered_at, last_seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                "INSERT INTO agents (id, hostname, arch, version, registered_at, last_seen_at, listen_addr)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)
                  ON CONFLICT(id) DO UPDATE SET
                    hostname=excluded.hostname, arch=excluded.arch, version=excluded.version,
-                   registered_at=excluded.registered_at, last_seen_at=excluded.last_seen_at",
-                params![id, hostname, arch, version, now_ms],
+                   registered_at=excluded.registered_at, last_seen_at=excluded.last_seen_at,
+                   listen_addr=excluded.listen_addr",
+                params![id, hostname, arch, version, now_ms, listen_addr],
             )
             .map_err(|e| format!("register: {}", e))?;
         }
@@ -60,14 +62,14 @@ impl AgentStore {
     pub async fn get(&self, id: &str) -> Result<AgentRecord, String> {
         let conn = self.db.conn().lock().await;
         conn.query_row(
-            "SELECT id, hostname, arch, version, config_json, config_version, target_config_version, registered_at, last_seen_at FROM agents WHERE id=?1",
+            "SELECT id, hostname, arch, version, config_json, config_version, target_config_version, registered_at, last_seen_at, listen_addr FROM agents WHERE id=?1",
             params![id],
             |row| {
                 Ok(AgentRecord {
                     id: row.get(0)?, hostname: row.get(1)?, arch: row.get(2)?,
                     version: row.get(3)?, config_json: row.get(4)?, config_version: row.get(5)?,
                     target_config_version: row.get(6)?, registered_at: row.get(7)?,
-                    last_seen_at: row.get(8)?,
+                    last_seen_at: row.get(8)?, listen_addr: row.get(9)?,
                 })
             },
         )
@@ -78,7 +80,7 @@ impl AgentStore {
         let conn = self.db.conn().lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT id, hostname, arch, version, config_json, config_version, target_config_version, registered_at, last_seen_at FROM agents",
+                "SELECT id, hostname, arch, version, config_json, config_version, target_config_version, registered_at, last_seen_at, listen_addr FROM agents",
             )
             .map_err(|e| format!("list agents: {}", e))?;
         let records = stmt
@@ -87,7 +89,7 @@ impl AgentStore {
                     id: row.get(0)?, hostname: row.get(1)?, arch: row.get(2)?,
                     version: row.get(3)?, config_json: row.get(4)?, config_version: row.get(5)?,
                     target_config_version: row.get(6)?, registered_at: row.get(7)?,
-                    last_seen_at: row.get(8)?,
+                    last_seen_at: row.get(8)?, listen_addr: row.get(9)?,
                 })
             })
             .map_err(|e| format!("list agents query: {}", e))?;
@@ -153,7 +155,7 @@ mod tests {
         let (_dir, store) = test_store();
 
         // 注册
-        let agent = store.register("agent-01", "edge-01", "armv7", "0.1.0").await.unwrap();
+        let agent = store.register("agent-01", "edge-01", "armv7", "0.1.0", "192.168.0.230:18080").await.unwrap();
         assert_eq!(agent.id, "agent-01");
         assert_eq!(agent.hostname, "edge-01");
         assert!(agent.last_seen_at.is_some());
@@ -164,7 +166,7 @@ mod tests {
         assert!(agent2.last_seen_at.unwrap() >= agent.last_seen_at.unwrap());
 
         // 重复注册（模拟重启）
-        let agent3 = store.register("agent-01", "edge-01-v2", "armv7", "0.1.1").await.unwrap();
+        let agent3 = store.register("agent-01", "edge-01-v2", "armv7", "0.1.1", "192.168.0.230:18080").await.unwrap();
         assert_eq!(agent3.version.as_deref(), Some("0.1.1"));
     }
 
@@ -172,8 +174,8 @@ mod tests {
     async fn test_list_and_delete() {
         let (_dir, store) = test_store();
 
-        store.register("a1", "h1", "x86", "1.0").await.unwrap();
-        store.register("a2", "h2", "arm", "1.0").await.unwrap();
+        store.register("a1", "h1", "x86", "1.0", "10.0.0.1:8080").await.unwrap();
+        store.register("a2", "h2", "arm", "1.0", "10.0.0.2:8080").await.unwrap();
 
         let list = store.list().await.unwrap();
         assert_eq!(list.len(), 2);
@@ -187,7 +189,7 @@ mod tests {
     async fn test_config_versions() {
         let (_dir, store) = test_store();
 
-        store.register("a1", "h1", "x86", "1.0").await.unwrap();
+        store.register("a1", "h1", "x86", "1.0", "10.0.0.1:8080").await.unwrap();
         // 默认 target_config_version = 1（与客户端初始 config_version 一致）
         assert!(store.should_update_config("a1", 0).await.unwrap());
         assert!(!store.should_update_config("a1", 1).await.unwrap());

@@ -306,8 +306,8 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db = Arc::new(Db::open(&db_path).unwrap());
         let agents = crate::server::agent_store::AgentStore::new(db.clone());
-        agents.register("agent-1", "h1", "x86", "1.0").await.unwrap();
-        agents.register("agent-2", "h2", "arm", "1.0").await.unwrap();
+        agents.register("agent-1", "h1", "x86", "1.0", "10.0.0.1:8080").await.unwrap();
+        agents.register("agent-2", "h2", "arm", "1.0", "10.0.0.2:8080").await.unwrap();
 
         let store = MetadataStore::new(db);
         store
