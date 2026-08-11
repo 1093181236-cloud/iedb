@@ -148,6 +148,37 @@ check_eq "$(echo "$AGENTS" | python3 -c "import sys,json; print(json.load(sys.st
 info "3. Agent detail"
 check_eq "$(curl -sf "http://127.0.0.1:18080/api/v1/agents/edge-01" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")" "edge-01" "agent detail by id"
 
+# ── Agent Status & Frontend ──────────────────────────────────────────────
+echo ""
+echo "=== Agent Status & Frontend ==="
+AGENT_URL="http://127.0.0.1:18081"
+SERVER_URL="http://127.0.0.1:18080"
+
+# Test: Agent status endpoint returns valid JSON
+check_ok "$(curl -s -o /dev/null -w '%{http_code}' "$AGENT_URL/api/v1/status")" "agent status endpoint"
+STATUS=$(curl -s "$AGENT_URL/api/v1/status")
+check_ok "$(echo "$STATUS" | jq -e '.agent.id' >/dev/null 2>&1 && echo ok || echo fail)" "status has agent.id"
+check_ok "$(echo "$STATUS" | jq -e '.system' >/dev/null 2>&1 && echo ok || echo fail)" "status has system"
+check_ok "$(echo "$STATUS" | jq -e '.buffer.database_count' >/dev/null 2>&1 && echo ok || echo fail)" "status has buffer.database_count"
+check_ok "$(echo "$STATUS" | jq -e '.wal.current_sequence' >/dev/null 2>&1 && echo ok || echo fail)" "status has wal.current_sequence"
+check_ok "$(echo "$STATUS" | jq -e '.snapshot.last_upload_status' >/dev/null 2>&1 && echo ok || echo fail)" "status has snapshot"
+check_ok "$(echo "$STATUS" | jq -e '.connection' >/dev/null 2>&1 && echo ok || echo fail)" "status has connection"
+
+# Test: Agent frontend is served at GET /
+check_ok "$(curl -s -o /dev/null -w '%{http_code}' "$AGENT_URL/")" "agent frontend served"
+FRONTEND=$(curl -s "$AGENT_URL/")
+check_ok "$(echo "$FRONTEND" | grep -q '<title>iedb Agent</title>' && echo ok || echo fail)" "agent frontend has correct title"
+
+# Test: Server returns listen_addr for registered agents
+check_ok "$(curl -s -o /dev/null -w '%{http_code}' "$SERVER_URL/api/v1/agents")" "server agent list"
+AGENTS_LIST=$(curl -s -X GET "$SERVER_URL/api/v1/agents")
+check_ok "$(echo "$AGENTS_LIST" | jq -e '.agents[0].listen_addr' >/dev/null 2>&1 && echo ok || echo fail)" "agent list includes listen_addr"
+
+# Test: Server frontend is still served
+check_ok "$(curl -s -o /dev/null -w '%{http_code}' "$SERVER_URL/")" "server frontend served"
+SERVER_FRONTEND=$(curl -s "$SERVER_URL/")
+check_ok "$(echo "$SERVER_FRONTEND" | grep -q '<title>iedb Console</title>' && echo ok || echo fail)" "server frontend has correct title"
+
 # ── 4. Write Line Protocol ──
 info "4. Write Line Protocol"
 OLD_TS=$(( ($(date +%s) - 60) * 1000000000 ))
