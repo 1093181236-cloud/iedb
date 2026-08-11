@@ -103,13 +103,25 @@ async function agents(){
 
 async function showAgentDetail(id){
   const a = await api('/api/v1/agents/'+id);
-  $('#agent-detail').innerHTML = `<div class="card">
-    <h2>${a.id}</h2>
-    <p>Hostname: ${a.hostname} | Arch: ${a.arch||'-'} | Version: ${a.version||'-'}</p>
-    <p>Config Version: ${a.config_version} | Target: ${a.target_config_version}</p>
-    <p>Registered: ${fmtTime(a.registered_at)} | Last Seen: ${fmtTime(a.last_seen)}</p>
-    <pre style="background:#0f172a;padding:12px;border-radius:6px;margin-top:8px;overflow:auto">${JSON.stringify(a.config_json?JSON.parse(a.config_json):'none',null,2)}</pre>
-  </div>`;
+  var html = '<div class="card"><h2>'+a.id+'</h2>';
+  html += '<p>Hostname: '+a.hostname+' | Arch: '+(a.arch||'-')+' | Version: '+(a.version||'-')+'</p>';
+  html += '<p>Config Version: '+a.config_version+' | Target: '+a.target_config_version+'</p>';
+  html += '<p>Registered: '+fmtTime(a.registered_at)+' | Last Seen: '+fmtTime(a.last_seen)+'</p>';
+
+  if(a.listen_addr){
+    html += '<div style="margin-top:16px;border:1px solid #334155;border-radius:8px;overflow:hidden">';
+    html += '<iframe src="http://'+a.listen_addr+'/" style="width:100%;height:600px;border:none;display:block" ';
+    html += 'onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'block\'"></iframe>';
+    html += '<div style="display:none;padding:40px;text-align:center;color:#94a3b8">';
+    html += 'Agent unreachable. <a href="http://'+a.listen_addr+'" target="_blank" style="color:#38bdf8">Open directly</a></div>';
+    html += '</div>';
+  }else{
+    html += '<p style="color:#94a3b8;margin-top:8px">No listen address reported by this agent</p>';
+  }
+
+  html += '<pre style="background:#0f172a;padding:12px;border-radius:6px;margin-top:8px;overflow:auto">'+JSON.stringify(a.config_json?JSON.parse(a.config_json):'none',null,2)+'</pre>';
+  html += '</div>';
+  $('#agent-detail').innerHTML = html;
 }
 
 async function editAgentConfig(id){
