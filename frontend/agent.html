@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>iedb Agent</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font:14px/1.5 system-ui,-apple-system,sans-serif;background:#f1f5f9;color:#1e293b;padding:20px;max-width:960px;margin:0 auto}
+h1{font-size:20px;color:#0f172a;margin-bottom:4px}
+.subtitle{color:#64748b;font-size:13px;margin-bottom:20px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.card{background:#fff;border-radius:10px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.card h3{font-size:14px;color:#64748b;margin-bottom:12px;text-transform:uppercase;letter-spacing:.5px}
+.card.wide{grid-column:1/-1}
+.stat{display:flex;justify-content:space-between;padding:4px 0;font-size:13px}
+.stat .label{color:#64748b}
+.stat .value{font-weight:600;font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #e2e8f0}
+th{color:#64748b;font-weight:500}
+tr{cursor:pointer}
+tr:hover{background:#f8fafc}
+.status{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.status.ok{background:#22c55e}
+.status.fail{background:#ef4444}
+.btn{padding:6px 16px;border:1px solid #cbd5e1;border-radius:6px;cursor:pointer;font-size:13px;background:#fff;color:#334155}
+.btn:hover{background:#f1f5f9}
+.btn-refresh{padding:4px 12px;font-size:12px;float:right}
+.detail-panel{background:#fff;border-radius:10px;padding:16px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.detail-panel h3{margin-bottom:12px;color:#0f172a}
+.result-table{max-height:300px;overflow:auto;margin-top:8px}
+.tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;background:#e2e8f0;margin-right:4px}
+.toast{position:fixed;top:12px;right:12px;padding:10px 20px;border-radius:6px;color:#fff;font-size:13px;z-index:99}
+.toast.error{background:#ef4444}
+</style>
+</head>
+<body>
+<h1 id="agent-title">iedb Agent</h1>
+<p class="subtitle" id="agent-subtitle">Loading...</p>
+<button class="btn btn-refresh" onclick="refresh()">&#x1F504; Refresh</button>
+
+<div class="grid" id="cards"></div>
+<div id="detail"></div>
+
+<script>
+function $(s){return document.querySelector(s)}
+function fmtTime(ms){
+  if(!ms||ms<=0)return'-';
+  if(ms>1e15) return new Date(ms/1e6).toISOString().replace('T',' ').slice(0,19);
+  return new Date(ms).toISOString().replace('T',' ').slice(0,19);
+}
+function fmtBytes(b){return b<1024?b+' B':b<1048576?(b/1024).toFixed(1)+' KB':(b/1048576).toFixed(1)+' MB'}
+function fmtDur(s){
+  if(s<60)return s+'s';
+  if(s<3600)return Math.floor(s/60)+'m '+s%60+'s';
+  var h=Math.floor(s/3600),m=Math.floor(s%3600/60);
+  return h+'h '+m+'m';
+}
+
+async function refresh(){
+  try{
+    var d=await (await fetch('/api/v1/status')).json();
+    render(d);
+  }catch(e){
+    document.body.innerHTML='<p style="color:#ef4444;padding:40px;text-align:center">Failed to load status: '+e.message+'</p>';
+  }
+}
+
+function render(d){
+  var a=d.agent;
+  $('#agent-title').textContent='iedb Agent: '+a.id;
+  $('#agent-subtitle').textContent=a.arch+' · v'+a.version+' · uptime '+fmtDur(a.uptime_secs);
+
+  var html='';
+
+  // System card
+  var s=d.system;
+  html+='<div class="card"><h3>💻 System</h3>';
+  html+='<div class="stat"><span class="label">CPU</span><span class="value">'+s.cpu_percent+'%</span></div>';
+  html+='<div class="stat"><span class="label">Memory</span><span class="value">'+s.memory_used_mb+' / '+s.memory_total_mb+' MB</span></div>';
+  html+='<div class="stat"><span class="label">Process RSS</span><span class="value">'+s.process_rss_mb+' MB</span></div>';
+  html+='</div>';
+
+  // Buffer card
+  var b=d.buffer;
+  html+='<div class="card"><h3>📊 Buffer</h3>';
+  html+='<div class="stat"><span class="label">Databases</span><span class="value">'+b.database_count+'</span></div>';
+  html+='<div class="stat"><span class="label">Total Rows</span><span class="value">'+b.total_rows.toLocaleString()+'</span></div>';
+  html+='<div class="stat"><span class="label">Memory</span><span class="value">'+fmtBytes(b.total_memory_bytes)+' / '+fmtBytes(b.memory_limit_bytes)+'</span></div>';
+  html+='<div style="margin-top:12px"><table><thead><tr><th>Table</th><th>Rows</th><th>Time Range</th></tr></thead><tbody>';
+  for(var db in b.databases){
+    var tables=b.databases[db].tables;
+    for(var tbl in tables){
+      var t=tables[tbl];
+      html+='<tr onclick="showDetail(\''+db+'\',\''+tbl+'\')"><td>'+db+'.'+tbl+'</td><td>'+t.row_count.toLocaleString()+'</td><td>'+fmtTime(t.time_min)+' ~ '+fmtTime(t.time_max)+'</td></tr>';
+    }
+  }
+  html+='</tbody></table></div></div>';
+
+  // WAL card
+  var w=d.wal;
+  html+='<div class="card"><h3>📝 WAL</h3>';
+  html+='<div class="stat"><span class="label">Sequence</span><span class="value">#'+w.current_sequence+'</span></div>';
+  html+='<div class="stat"><span class="label">Pending Ops</span><span class="value">'+w.pending_ops+'</span></div>';
+  html+='<div class="stat"><span class="label">Data Dir</span><span class="value">'+fmtBytes(w.data_dir_size_bytes)+'</span></div>';
+  html+='</div>';
+
+  // Snapshot card
+  var sn=d.snapshot;
+  html+='<div class="card"><h3>📤 Snapshot</h3>';
+  html+='<div class="stat"><span class="label">Last</span><span class="value">'+fmtTime(sn.last_snapshot_at||0)+(sn.last_upload_status==='ok'?' <span class="status ok"></span>':' <span class="status fail"></span>')+'</span></div>';
+  html+='<div class="stat"><span class="label">Size</span><span class="value">'+fmtBytes(sn.last_upload_size_bytes)+'</span></div>';
+  html+='<div class="stat"><span class="label">Next</span><span class="value">'+fmtDur(sn.next_snapshot_in_secs)+'</span></div>';
+  html+='</div>';
+
+  // Connection card
+  var c=d.connection;
+  html+='<div class="card wide"><h3>🔗 Connection</h3>';
+  html+='<div class="stat"><span class="label">Server</span><span class="value">'+c.server_url+' '+(c.registered?'<span class="status ok"></span> registered':'<span class="status fail"></span> not registered')+'</span></div>';
+  html+='<div class="stat"><span class="label">Config Version</span><span class="value">'+c.config_version+'</span></div>';
+  html+='<div class="stat"><span class="label">Last Heartbeat</span><span class="value">'+fmtTime(c.last_heartbeat_at||0)+(c.heartbeat_failures>0?' <span style="color:#ef4444">('+c.heartbeat_failures+' failures)</span>':'')+'</span></div>';
+  html+='</div>';
+
+  $('#cards').innerHTML=html;
+}
+
+async function showDetail(db,table){
+  try{
+    var d=await (await fetch('/api/v1/status')).json();
+    var t=(d.buffer.databases[db]||{}).tables||{};
+    var info=t[table];
+    if(!info){$('#detail').innerHTML='';return}
+
+    var q=await (await fetch('/query?db='+encodeURIComponent(db)+'&table='+encodeURIComponent(table))).json();
+    var rows=q.rows||[];
+    var cols=rows.length?Object.keys(rows[0]).filter(function(k){return k!=='tags'}):[];
+
+    var html='<div class="detail-panel"><h3>📊 '+db+'.'+table+' <button class="btn" style="float:right;font-size:11px" onclick="$(\'#detail\').innerHTML=\'\'">✕ Close</button></h3>';
+    html+='<p style="font-size:13px;color:#64748b">Time: '+fmtTime(info.time_min)+' ~ '+fmtTime(info.time_max)+'</p>';
+    html+='<p style="font-size:13px">Tags: '+(info.tag_keys||[]).map(function(k){return '<span class="tag">'+k+'</span>'}).join('')+'</p>';
+    html+='<p style="font-size:13px">Fields: '+(info.field_defs||[]).map(function(f){return '<span class="tag">'+f[0]+' ('+f[1]+')</span>'}).join('')+'</p>';
+
+    if(rows.length){
+      html+='<div class="result-table"><table><thead><tr>';
+      html+=cols.map(function(c){return '<th>'+c+'</th>'}).join('');
+      html+='</tr></thead><tbody>';
+      for(var i=0;i<Math.min(rows.length,50);i++){
+        html+='<tr>'+cols.map(function(c){return '<td>'+(rows[i][c]!=null?rows[i][c]:'NULL')+'</td>'}).join('')+'</tr>';
+      }
+      html+='</tbody></table></div>';
+    }else{
+      html+='<p style="color:#94a3b8;margin-top:12px">No rows in buffer</p>';
+    }
+    html+='</div>';
+    $('#detail').innerHTML=html;
+  }catch(e){
+    $('#detail').innerHTML='<div class="detail-panel" style="color:#ef4444">Error: '+e.message+'</div>';
+  }
+}
+
+refresh();
+</script>
+</body>
+</html>
