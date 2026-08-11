@@ -6,6 +6,7 @@ pub mod flush;
 pub mod write;
 pub mod query;
 pub mod system;
+pub mod status;
 
 use crate::config::{AgentClientConfig, Config};
 use reqwest::Client;
