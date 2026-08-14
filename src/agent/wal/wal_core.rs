@@ -14,6 +14,9 @@ pub struct WalManager {
     op_count: usize,
     op_limit: usize,
     pending_ops: Vec<WalOp>,
+    /// Optional runtime-hot config; when present its max_write_buffer_ops
+    /// overrides the static op_limit (server can change it without restart).
+    hot: Option<std::sync::Arc<crate::agent::hot_config::HotConfig>>,
 }
 
 impl WalManager {
@@ -44,7 +47,14 @@ impl WalManager {
             op_count: 0,
             op_limit: config.max_write_buffer_ops,
             pending_ops: Vec::with_capacity(config.max_write_buffer_ops),
+            hot: None,
         })
+    }
+
+    /// Attach the runtime-hot config so max_write_buffer_ops can change
+    /// without a restart.
+    pub fn set_hot_config(&mut self, hot: std::sync::Arc<crate::agent::hot_config::HotConfig>) {
+        self.hot = Some(hot);
     }
 
     /// Return the current WAL sequence number (next file to be written).
@@ -58,8 +68,13 @@ impl WalManager {
     }
 
     /// Buffer a write op. Returns `BufferFull` error if over limit.
+    /// The limit is the runtime-hot value when a HotConfig is attached.
     pub fn buffer_op(&mut self, op: WalOp) -> Result<(), WalError> {
-        if self.op_count >= self.op_limit {
+        let limit = self
+            .hot
+            .as_ref()
+            .map_or(self.op_limit, |h| h.wal_max_buffer_ops());
+        if self.op_count >= limit {
             return Err(WalError::BufferFull(self.op_count));
         }
         self.op_count += 1;
@@ -261,6 +276,44 @@ mod tests {
     fn test_data_dir() -> PathBuf {
         let seq = TEST_SEQ.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("iedb_wal_test_{}_{}", std::process::id(), seq))
+    }
+
+    #[tokio::test]
+    async fn test_buffer_op_respects_hot_limit() {
+        let tmp = test_data_dir();
+        let config = WalConfig {
+            flush_interval_secs: 1,
+            max_write_buffer_ops: 100,
+        };
+        let mut wm = WalManager::new(&tmp, &config).await.unwrap();
+
+        // Static limit is 100 — without the hot override both ops fit.
+        // (TOML-built so the literal stays valid under every feature combo.)
+        let hot_cfg: crate::config::Config = toml::from_str(&format!(
+            r#"
+            [server]
+            port = 0
+            [data]
+            dir = "{}"
+            [flush]
+            snapshot_interval = "10m"
+            memory_limit = "512MB"
+            [wal]
+            max_write_buffer_ops = 100
+            "#,
+            tmp.display()
+        ))
+        .unwrap();
+        let hot = std::sync::Arc::new(crate::agent::hot_config::HotConfig::from_config(&hot_cfg));
+        // Hot limit of 1 must take effect without a restart.
+        hot.apply_update(&serde_json::json!({"wal": {"max_write_buffer_ops": 1}}));
+        wm.set_hot_config(hot);
+
+        assert!(wm.buffer_op(WalOp::Noop).is_ok(), "first op under hot limit 1");
+        assert!(
+            matches!(wm.buffer_op(WalOp::Noop), Err(WalError::BufferFull(_))),
+            "second op must be rejected by the hot limit"
+        );
     }
 
     #[tokio::test]

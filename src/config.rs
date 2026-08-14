@@ -215,26 +215,43 @@ impl Config {
     }
 }
 
-fn parse_duration(s: &str) -> i64 {
+/// Parse a duration like "10m" / "30s". Returns None for malformed input
+/// (callers can then choose a fallback or skip a hot update).
+pub(crate) fn parse_duration_opt(s: &str) -> Option<i64> {
     let s = s.trim();
     if s.ends_with('m') {
-        s[..s.len()-1].parse::<i64>().unwrap_or(10) * 60
+        s[..s.len() - 1].parse::<i64>().ok().map(|v| v * 60)
     } else if s.ends_with('s') {
-        s[..s.len()-1].parse::<i64>().unwrap_or(600)
+        s[..s.len() - 1].parse::<i64>().ok()
     } else {
-        600
+        None
     }
 }
 
-fn parse_bytes(s: &str) -> usize {
+/// Parse a size like "512MB" / "1GB". Returns None for malformed input.
+pub(crate) fn parse_bytes_opt(s: &str) -> Option<usize> {
     let s = s.trim().to_uppercase();
     if s.ends_with("MB") {
-        s[..s.len()-2].parse::<usize>().unwrap_or(512) * 1024 * 1024
+        s[..s.len() - 2]
+            .parse::<usize>()
+            .ok()
+            .map(|v| v * 1024 * 1024)
     } else if s.ends_with("GB") {
-        s[..s.len()-2].parse::<usize>().unwrap_or(1) * 1024 * 1024 * 1024
+        s[..s.len() - 2]
+            .parse::<usize>()
+            .ok()
+            .map(|v| v * 1024 * 1024 * 1024)
     } else {
-        512 * 1024 * 1024
+        None
     }
+}
+
+fn parse_duration(s: &str) -> i64 {
+    parse_duration_opt(s).unwrap_or(600)
+}
+
+fn parse_bytes(s: &str) -> usize {
+    parse_bytes_opt(s).unwrap_or(512 * 1024 * 1024)
 }
 
 #[cfg(test)]

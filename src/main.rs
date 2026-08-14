@@ -109,6 +109,18 @@ async fn run_agent(
     let wal_manager = Arc::new(Mutex::new(WalManager::new(&data_dir, &config.wal).await?));
     wal_manager.lock().await.replay(&buffer).await?;
 
+    // 2b. Runtime-hot config: snapshot_interval / memory_limit / wal.* can be
+    // changed by the server without restart. Starts from local config, then
+    // the cached server config (if any), then live heartbeat updates.
+    let hot_config = Arc::new(iedb::agent::hot_config::HotConfig::from_config(&config));
+    if let Ok(cached) = std::fs::read_to_string(data_dir.join("agent_config.cache")) {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cached) {
+            hot_config.apply_update(&cfg);
+            tracing::info!("Applied cached config to hot runtime settings");
+        }
+    }
+    wal_manager.lock().await.set_hot_config(hot_config.clone());
+
     // 3. HTTP client（供快照上传用）
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -126,12 +138,6 @@ async fn run_agent(
     let agent_client = if is_mix { None } else { Some(Arc::new(AgentClient::new(config.clone(), listen_addr))) };
 
     let mut config_version: u64 = 0;
-    // I3: try loading cached config before registration (fallback if server unreachable)
-    if let Ok(cached) = std::fs::read_to_string(data_dir.join("agent_config.cache")) {
-        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cached) {
-            tracing::info!("Loaded cached config from agent_config.cache");
-        }
-    }
 
     if !is_mix {
         if let Some(ref ac) = agent_client {
@@ -140,6 +146,7 @@ async fn run_agent(
                     tracing::info!("Agent registered, config_version={}", ver);
                     config_version = ver;
                     // I3: apply server-provided config to runtime settings
+                    hot_config.apply_update(&cfg);
                     // Cache config for restart fallback
                     if let Ok(json) = serde_json::to_string_pretty(&cfg) {
                         let _ = std::fs::write(data_dir.join("agent_config.cache"), &json);
@@ -147,12 +154,6 @@ async fn run_agent(
                 }
                 Err(e) => {
                     tracing::warn!("Registration failed: {}, using local/cached config", e);
-                    // Try cache fallback
-                    if let Ok(cached) = std::fs::read_to_string(data_dir.join("agent_config.cache")) {
-                        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cached) {
-                            tracing::info!("Loaded cached config from agent_config.cache");
-                        }
-                    }
                 }
             }
         }
@@ -162,7 +163,9 @@ async fn run_agent(
     if !is_mix {
         let hb_client = agent_client.clone().unwrap();
         let hb_buffer = buffer.clone();
+        let hb_hot = hot_config.clone();
         let hb_shutdown = shutdown_signal.clone();
+        let hb_cache_path = data_dir.join("agent_config.cache");
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             let mut last_schema: std::collections::HashMap<String, (Vec<String>, Vec<(String, String)>)> =
@@ -179,11 +182,22 @@ async fn run_agent(
             };
             match hb_client.heartbeat(config_version, schema_changes).await {
                 Ok(Some(update)) => {
-                    // I3: apply config update from server
+                    // I3: apply config update from server — hot fields go live
+                    // immediately; the rest is cached for restart.
+                    hb_hot.apply_update(&update);
                     if let Some(ver) = update.get("version").and_then(|v| v.as_u64()) {
                         config_version = ver;
                     } else {
                         config_version += 1;
+                    }
+                    // merge into the restart cache (best-effort: keep the
+                    // previously cached JSON and overlay the update)
+                    let cached = std::fs::read_to_string(&hb_cache_path).unwrap_or_default();
+                    let mut merged: serde_json::Value = serde_json::from_str(&cached)
+                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    merge_json(&mut merged, &update);
+                    if let Ok(json) = serde_json::to_string_pretty(&merged) {
+                        let _ = std::fs::write(&hb_cache_path, &json);
                     }
                     tracing::info!("Config updated to version {}", config_version);
                 }
@@ -194,17 +208,17 @@ async fn run_agent(
     });
     } // end if !is_mix
 
-    // 6. WAL flush 后台任务
+    // 6. WAL flush 后台任务（间隔支持热更新，每轮循环重读）
     let wal_flush = wal_manager.clone();
     let wal_buffer = buffer.clone();
+    let wal_hot = hot_config.clone();
     let wal_shutdown = shutdown_signal.clone();
-    let wal_interval = config.wal.flush_interval_secs;
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(wal_interval));
         loop {
+            let wal_interval = wal_hot.wal_flush_interval().max(1);
             tokio::select! {
                 _ = wal_shutdown.notified() => break,
-                _ = interval.tick() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(wal_interval)) => {}
             }
             // C1 fix: scope wal guard release before acquiring buffer lock
             let ops = {
@@ -234,6 +248,7 @@ async fn run_agent(
         config.clone(),
         client.clone(),
     );
+    snapshot_scheduler.hot = Some(hot_config.clone());
     #[cfg(feature = "server")]
     if let Some(cb) = _on_local_flush {
         snapshot_scheduler.on_local_flush = Some(cb);
@@ -350,6 +365,25 @@ async fn run_agent(
     shutdown_signal.notify_waiters();
     tracing::info!("Agent shutdown complete");
     Ok(())
+}
+
+/// Recursively merge `update` into `base` (both JSON objects) — used to
+/// overlay a server config update onto the cached restart config.
+#[cfg(feature = "agent")]
+fn merge_json(base: &mut serde_json::Value, update: &serde_json::Value) {
+    match (base, update) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(u)) => {
+            for (k, v) in u {
+                match b.get_mut(k) {
+                    Some(existing) => merge_json(existing, v),
+                    None => {
+                        b.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (b, u) => *b = u.clone(),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

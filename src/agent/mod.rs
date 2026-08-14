@@ -4,6 +4,7 @@ pub mod buffer;
 pub mod wal;
 pub mod flush;
 pub mod federation_query;
+pub mod hot_config;
 pub mod write;
 pub mod query;
 pub mod system;

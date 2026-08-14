@@ -35,6 +35,9 @@ pub struct SnapshotScheduler {
     pub on_local_flush: Option<Arc<LocalFlushCallback>>,
     last_snapshot: tokio::sync::Mutex<SnapshotStatus>,
     started_at: std::time::Instant,
+    /// Optional runtime-hot config; when present its snapshot_interval /
+    /// memory_limit override the static config (server changes them live).
+    pub hot: Option<Arc<crate::agent::hot_config::HotConfig>>,
 }
 
 impl SnapshotScheduler {
@@ -60,12 +63,28 @@ impl SnapshotScheduler {
                 next_in_secs: snapshot_interval_secs,
             }),
             started_at: std::time::Instant::now(),
+            hot: None,
         }
     }
 
+    /// Effective snapshot interval: hot config when attached, else static.
+    pub fn current_snapshot_interval(&self) -> i64 {
+        self.hot
+            .as_ref()
+            .map_or_else(|| self.config.snapshot_interval_secs(), |h| h.snapshot_interval_secs())
+    }
+
+    /// Effective memory limit: hot config when attached, else static.
+    pub fn current_memory_limit(&self) -> usize {
+        self.hot
+            .as_ref()
+            .map_or_else(|| self.config.memory_limit_bytes(), |h| h.memory_limit_bytes())
+    }
+
     /// Run the background snapshot + memory protection + staging retry loop.
+    /// snapshot_interval / memory_limit are re-read every iteration so
+    /// hot config updates take effect within one cycle (≤5s).
     pub async fn run(&self) {
-        let snapshot_interval = Duration::from_secs(self.config.snapshot_interval_secs() as u64);
         let memory_check_interval = Duration::from_secs(5);
         let staging_retry_interval_ticks = 6; // 6 × 5s = 30s
         let mut last_snapshot = Instant::now();
@@ -95,7 +114,9 @@ impl SnapshotScheduler {
                 buf.total_estimated_size()
             };
 
-            let memory_limit = self.config.memory_limit_bytes();
+            let memory_limit = self.current_memory_limit();
+            let snapshot_interval =
+                Duration::from_secs(self.current_snapshot_interval().max(1) as u64);
             let should_force = total_bytes >= memory_limit;
             let should_timed = last_snapshot.elapsed() >= snapshot_interval;
 
@@ -716,6 +737,62 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".wal"))
             .count();
         assert_eq!(wal_files, 0, "WAL must be cleaned after staging handoff");
+    }
+
+    /// Hot config must override the static config for the effective values.
+    #[tokio::test]
+    async fn test_current_values_follow_hot_config() {
+        use crate::agent::buffer::Buffer;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let wal_cfg = crate::config::WalConfig {
+            flush_interval_secs: 1,
+            max_write_buffer_ops: 100_000,
+        };
+        let wal = Arc::new(Mutex::new(crate::agent::wal::wal_core::WalManager::new(&data_dir, &wal_cfg).await.unwrap()));
+        let buffer = Arc::new(Mutex::new(Buffer::new()));
+
+        let toml = format!(
+            r#"
+            [server]
+            port = 8080
+            [data]
+            dir = "{}"
+            [flush]
+            snapshot_interval = "10m"
+            backend = "http"
+            memory_limit = "512MB"
+            "#,
+            data_dir.display()
+        );
+        let config: crate::config::Config = toml::from_str(&toml).unwrap();
+        let mut scheduler = SnapshotScheduler::new(
+            buffer,
+            wal,
+            Arc::new(config),
+            reqwest::Client::new(),
+        );
+
+        // Without hot config: static values
+        assert_eq!(scheduler.current_snapshot_interval(), 600);
+        assert_eq!(scheduler.current_memory_limit(), 512 * 1024 * 1024);
+
+        // With hot config: hot values win
+        let hot = Arc::new(crate::agent::hot_config::HotConfig::from_config(
+            &scheduler.config,
+        ));
+        scheduler.hot = Some(hot.clone());
+        hot.apply_update(&serde_json::json!({
+            "flush": {"snapshot_interval": "30s", "memory_limit": "256MB"}
+        }));
+        assert_eq!(scheduler.current_snapshot_interval(), 30);
+        assert_eq!(scheduler.current_memory_limit(), 256 * 1024 * 1024);
+
+        // A further update is picked up immediately (no restart)
+        hot.apply_update(&serde_json::json!({"flush": {"snapshot_interval": "2m"}}));
+        assert_eq!(scheduler.current_snapshot_interval(), 120);
     }
 
     /// A staging retry must upload the file and delete it on success.
