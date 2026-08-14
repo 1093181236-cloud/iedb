@@ -178,7 +178,7 @@ impl WriteHandler {
         }
 
         // Buffer all batches to WAL and flush synchronously (C1 fix: single write path)
-        let ops = {
+        let (ops, wal_seq) = {
             let mut wal = self.wal.lock().await;
             for batch in &batches {
                 if let Err(e) = wal.buffer_op(WalOp::Write(batch.clone())) {
@@ -188,7 +188,7 @@ impl WriteHandler {
                         .expect("valid response"));
                 }
             }
-            match wal.flush().await {
+            let ops = match wal.flush().await {
                 Ok(ops) => ops,
                 Err(e) => {
                     return Ok(Response::builder()
@@ -196,7 +196,13 @@ impl WriteHandler {
                         .body(format!("WAL flush error: {}", e))
                         .expect("valid response"));
                 }
-            }
+            };
+            // The flushed ops live in the WAL file written with this seq —
+            // track it on the buffer rows so snapshot WAL cleanup can
+            // advance (a constant 0 here made cleanup a permanent no-op
+            // and let .wal files accumulate unboundedly).
+            let wal_seq = wal.current_sequence().saturating_sub(1);
+            (ops, wal_seq)
         };
 
         // Apply flushed ops to memory buffer (sole path for buffer insertion)
@@ -204,7 +210,7 @@ impl WriteHandler {
             let mut buf = self.buffer.lock().await;
             for op in &ops {
                 if let WalOp::Write(batch) = op {
-                    apply_write_batch(&mut buf, batch, 0);
+                    apply_write_batch(&mut buf, batch, wal_seq);
                 }
             }
         }
@@ -309,6 +315,31 @@ mod tests {
             .uri(uri)
             .body(TestBody::from_bytes(Bytes::from(body.to_vec())))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_write_applies_rows_with_real_wal_seq() {
+        let (handler, buffer, _dir) = make_handler(1024, 100).await;
+
+        let resp = handler
+            .handle(post_req("/write?db=mydb", b"cpu,host=a usage=1.5"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let buf = buffer.lock().await;
+        let table = buf.get_table("mydb", "cpu").unwrap();
+        let min_seq = table
+            .chunks
+            .iter()
+            .map(|c| c.min_wal_seq)
+            .min()
+            .unwrap_or(0);
+        assert_eq!(
+            min_seq, 1,
+            "chunk min_wal_seq must carry the real WAL file seq (first file = 1), got {}",
+            min_seq
+        );
     }
 
     #[tokio::test]
