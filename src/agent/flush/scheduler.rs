@@ -812,6 +812,105 @@ mod tests {
 
     /// A failed retry must keep the staging file for the next round.
     #[tokio::test]
+    async fn test_staging_retry_skips_unrecognized_filenames() {
+        use crate::agent::buffer::Buffer;
+        use std::sync::Arc;
+
+        // No server needed — the unrecognized file must be skipped without
+        // any upload attempt, and the valid file would be attempted. Use a
+        // mock server to observe only the valid file reaches it.
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let seen = seen_clone.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().await.push(req.uri().to_string());
+                            Ok::<_, hyper::Error>(
+                                hyper::Response::builder()
+                                    .status(200)
+                                    .body("ok".to_string())
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let staging_dir = data_dir.join("staging").join("db1").join("tbl1");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        // valid chunk_time-named file
+        let valid = staging_dir.join("123.parquet");
+        std::fs::write(&valid, b"parquet bytes").unwrap();
+        // old-format timestamp-named file (pre chunk_time naming)
+        let legacy = staging_dir.join("20260809_052051_190585464.parquet");
+        std::fs::write(&legacy, b"old data").unwrap();
+
+        let wal_cfg = crate::config::WalConfig {
+            flush_interval_secs: 1,
+            max_write_buffer_ops: 100_000,
+        };
+        let wal = Arc::new(Mutex::new(crate::agent::wal::wal_core::WalManager::new(&data_dir, &wal_cfg).await.unwrap()));
+        let buffer = Arc::new(Mutex::new(Buffer::new()));
+
+        let toml = format!(
+            r#"
+            [server]
+            port = 8080
+            [data]
+            dir = "{}"
+            [flush]
+            snapshot_interval = "10m"
+            backend = "http"
+            memory_limit = "512MB"
+            [agent]
+            id = "test-agent"
+            server_url = "http://{}"
+            "#,
+            data_dir.display(),
+            addr
+        );
+        let config: crate::config::Config = toml::from_str(&toml).unwrap();
+        let scheduler = SnapshotScheduler::new(
+            buffer,
+            wal,
+            Arc::new(config),
+            reqwest::Client::new(),
+        );
+
+        let retried = scheduler.retry_staging().await.unwrap();
+
+        assert_eq!(retried, 1, "only the chunk_time-named file is retried");
+        assert!(!valid.exists(), "valid file must be delivered and deleted");
+        assert!(legacy.exists(), "legacy-named file must be left untouched");
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 1, "only one upload attempt for the valid file");
+        assert!(seen[0].contains("chunk_time=123"));
+    }
+
+    /// A failed retry must keep the staging file for the next round.
+    #[tokio::test]
     async fn test_staging_retry_keeps_file_on_failure() {
         use crate::agent::buffer::Buffer;
         use hyper::service::service_fn;
