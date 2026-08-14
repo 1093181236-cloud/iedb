@@ -15,6 +15,40 @@ struct Cli {
     config: String,
 }
 
+/// Minimal `hyper::body::Body` wrapper so the agent HTTP match can return
+/// arbitrary bytes (e.g. serialized Parquet) from a single `service_fn`.
+#[cfg(feature = "agent")]
+struct ByteBody(Vec<u8>);
+
+#[cfg(feature = "agent")]
+impl hyper::body::Body for ByteBody {
+    type Data = hyper::body::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if self.0.is_empty() {
+            return std::task::Poll::Ready(None);
+        }
+        let bytes = std::mem::take(&mut self.0);
+        std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(
+            hyper::body::Bytes::from(bytes),
+        ))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        let mut hint = hyper::body::SizeHint::new();
+        hint.set_exact(self.0.len() as u64);
+        hint
+    }
+}
+
 /// Agent mode entry point: registers with the iedb server, runs the
 /// in-memory buffer + WAL pipeline, snapshot scheduler, and serves
 /// the local HTTP API (POST /write, GET /query, GET /health).
@@ -218,6 +252,9 @@ async fn run_agent(
     let query_handler = Arc::new(QueryHandler {
         buffer: buffer.clone(),
     });
+    let federation_handler = Arc::new(iedb::agent::federation_query::FederationQueryHandler {
+        buffer: buffer.clone(),
+    });
     let status_handler = Arc::new(iedb::agent::status::StatusHandler {
         buffer: buffer.clone(),
         wal: wal_manager.clone(),
@@ -242,35 +279,41 @@ async fn run_agent(
                 let write_handler = write_handler.clone();
                 let query_handler = query_handler.clone();
                 let status_handler = status_handler.clone();
+                let federation_handler = federation_handler.clone();
                 tokio::spawn(async move {
                     let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
                         let w = write_handler.clone();
                         let q = query_handler.clone();
                         let s = status_handler.clone();
+                        let federation_handler = federation_handler.clone();
                         async move {
                             match (req.method(), req.uri().path()) {
-                                (&Method::POST, "/write") => w.handle(req).await,
-                                (&Method::GET, "/query") => q.handle(req).await,
+                                (&Method::POST, "/write") => w.handle(req).await.map(|r| r.map(|s| ByteBody(s.into_bytes()))),
+                                (&Method::GET, "/query") => q.handle(req).await.map(|r| r.map(|s| ByteBody(s.into_bytes()))),
                                 (&Method::GET, "/api/v1/status") => {
                                     let s = s.clone();
-                                    s.handle(req).await
+                                    s.handle(req).await.map(|r| r.map(|s| ByteBody(s.into_bytes())))
                                 }
-                                (&Method::GET, "/health") => Ok(Response::new("ok".into())),
+                                (&Method::GET, "/health") => Ok(Response::new(ByteBody(b"ok".to_vec()))),
+                                (&Method::GET, "/api/v1/query/parquet") => {
+                                    let fh = federation_handler.clone();
+                                    fh.handle(req).await.map(|r| r.map(ByteBody))
+                                }
                                 (&Method::GET, p) if p == "/" || p.ends_with(".html") || p.ends_with(".js") || p.ends_with(".css") => {
                                     let path = req.uri().path().to_string();
                                     if let Some((body, mime)) = iedb::frontend::serve("agent.html", &path) {
                                         Ok(hyper::Response::builder().status(200)
-                                            .header("Content-Type", mime).body(body).unwrap())
+                                            .header("Content-Type", mime).body(ByteBody(body.into_bytes())).unwrap())
                                     } else {
                                         Ok(hyper::Response::builder()
                                             .status(StatusCode::NOT_FOUND)
-                                            .body("not found".into())
+                                            .body(ByteBody(b"not found".to_vec()))
                                             .unwrap())
                                     }
                                 }
                                 _ => Ok(Response::builder()
                                     .status(StatusCode::NOT_FOUND)
-                                    .body("not found".into())
+                                    .body(ByteBody(b"not found".to_vec()))
                                     .expect("valid response")),
                             }
                         }
