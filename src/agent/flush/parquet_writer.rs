@@ -12,8 +12,14 @@ fn sanitize_column_name(name: &str) -> String {
 }
 
 /// Merge-sort rows from multiple chunks, dedup, and write as a single Parquet file.
+/// Rows outside [start_ns, end_ns] are excluded (bounds inclusive; None = unbounded).
 /// Returns the serialized Parquet bytes.
-pub fn flush_chunks_to_parquet(table: &Table, chunks: &[&Chunk]) -> Result<Vec<u8>, String> {
+pub fn flush_chunks_to_parquet(
+    table: &Table,
+    chunks: &[&Chunk],
+    start_ns: Option<i64>,
+    end_ns: Option<i64>,
+) -> Result<Vec<u8>, String> {
     if chunks.is_empty() {
         return Err("no chunks to flush".into());
     }
@@ -42,8 +48,17 @@ pub fn flush_chunks_to_parquet(table: &Table, chunks: &[&Chunk]) -> Result<Vec<u
             .map_err(|e| format!("parquet schema error: {}", e))?,
     );
 
-    // Step 2: Collect and merge-sort all rows
-    let mut all_rows: Vec<&Row> = chunks.iter().flat_map(|c| c.rows.iter()).collect();
+    // Step 2: Collect rows (with optional time filter), merge-sort, dedup
+    let mut all_rows: Vec<&Row> = chunks
+        .iter()
+        .flat_map(|c| c.rows.iter())
+        .filter(|r| {
+            start_ns.map_or(true, |s| r.time >= s) && end_ns.map_or(true, |e| r.time <= e)
+        })
+        .collect();
+    if all_rows.is_empty() {
+        return Err("no rows in time range".into());
+    }
     all_rows.sort_by_key(|r| r.time);
     // C2 fix: dedup by full row identity (time + tags + fields), not just time+tags
     all_rows.dedup_by(|a, b| a.time == b.time && a.tag_values == b.tag_values && a.field_values == b.field_values);
@@ -258,7 +273,8 @@ mod tests {
         let expected_row_count = chunk.rows.len();
 
         let parquet_bytes =
-            flush_chunks_to_parquet(&table, &[&chunk]).expect("flush_chunks_to_parquet");
+            flush_chunks_to_parquet(&table, &[&chunk], None, None)
+                .expect("flush_chunks_to_parquet");
 
         // Read back the parquet file
         let bytes = Bytes::from(parquet_bytes);
@@ -301,6 +317,35 @@ mod tests {
     }
 
     #[test]
+    fn test_time_range_filter() {
+        let (table, chunk) = make_test_table_with_data();
+        // rows at time 100, 200, 300
+        let bytes = flush_chunks_to_parquet(&table, &[&chunk], Some(150), Some(250))
+            .expect("filtered parquet");
+
+        let reader = SerializedFileReader::new(Bytes::from(bytes)).expect("reader");
+        assert_eq!(reader.metadata().file_metadata().num_rows() as usize, 1,
+            "only row at time=200 should survive");
+        let mut it = reader.get_row_iter(None).unwrap();
+        let row = it.next().unwrap().unwrap();
+        assert_eq!(row.get_long(0).unwrap(), 200);
+    }
+
+    #[test]
+    fn test_time_range_open_bounds() {
+        let (table, chunk) = make_test_table_with_data();
+        // start only: time >= 250 → row 300
+        let bytes = flush_chunks_to_parquet(&table, &[&chunk], Some(250), None).unwrap();
+        let reader = SerializedFileReader::new(Bytes::from(bytes)).unwrap();
+        assert_eq!(reader.metadata().file_metadata().num_rows() as usize, 1);
+
+        // end only: time <= 150 → row 100
+        let bytes = flush_chunks_to_parquet(&table, &[&chunk], None, Some(150)).unwrap();
+        let reader = SerializedFileReader::new(Bytes::from(bytes)).unwrap();
+        assert_eq!(reader.metadata().file_metadata().num_rows() as usize, 1);
+    }
+
+    #[test]
     fn test_parquet_empty_chunks_error() {
         let table = Table {
             name: "empty".to_string(),
@@ -314,7 +359,7 @@ mod tests {
             chunks: Vec::new(),
         };
         let empty_chunks: &[&Chunk] = &[];
-        let result = flush_chunks_to_parquet(&table, empty_chunks);
+        let result = flush_chunks_to_parquet(&table, empty_chunks, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no chunks"));
     }

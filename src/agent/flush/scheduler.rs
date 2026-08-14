@@ -167,7 +167,8 @@ impl SnapshotScheduler {
 
             let table = table_for_schema.ok_or("table not found")?;
             let parquet_data =
-                flush_chunks_to_parquet(&table, &chunk_refs).map_err(|e| format!("parquet write: {}", e))?;
+                flush_chunks_to_parquet(&table, &chunk_refs, None, None)
+                    .map_err(|e| format!("parquet write: {}", e))?;
 
             // Upload
             // In the new config, the agent registers against the iedb server via
