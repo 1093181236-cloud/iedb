@@ -101,12 +101,14 @@ impl MetadataStore {
             .query_row("SELECT id FROM tables WHERE db_name=?1 AND table_name=?2", params![db_name, table_name], |r| r.get(0))
             .map_err(|e| format!("get table id: {}", e))?;
 
-        // 记录 agent→table 关系
+        // 记录 agent→table 关系。此前错误被 .ok() 吞掉：外键约束失败
+        // （agent 未注册）会静默丢失映射，federation 因此看不到该 agent。
+        // 现在向上传播，由调用方记录日志/跳过，而不是无声失败。
         conn.execute(
             "INSERT OR IGNORE INTO agent_tables (agent_id, table_id) VALUES (?1, ?2)",
             params![agent_id, table_id],
         )
-        .ok();
+        .map_err(|e| format!("record agent table: {}", e))?;
 
         for (name, value_type) in field_defs {
             conn.execute(

@@ -107,11 +107,17 @@ impl IngestApiHandler {
                 .await
                 .ok();
         }
-        // Record agent→table relationship from ingest
-        self.metadata
+        // Record agent→table relationship from ingest. The mapping can fail
+        // (e.g. FK violation when the agent never registered); log it and
+        // continue — the upload itself stays successful.
+        if let Err(e) = self
+            .metadata
             .merge_schema(&db, &table, &agent_id, &[], &[])
             .await
-            .ok();
+        {
+            tracing::warn!(agent = %agent_id, db = %db, table = %table,
+                "record agent table after ingest: {}", e);
+        }
 
         // 新表注册到 DataFusion（首次上传时；已注册的表是 no-op）
         if let Some(engine) = &self.engine {

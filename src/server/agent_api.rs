@@ -114,7 +114,14 @@ impl AgentApiHandler {
                         }).collect())
                         .unwrap_or_default();
                     if !db.is_empty() && !table.is_empty() {
-                        let _ = md.merge_schema(db, table, id, &tag_keys, &field_defs).await;
+                        // The agent row exists (heartbeat required it), so
+                        // the agent_tables insert normally succeeds; on the
+                        // off chance it fails, log it instead of silently
+                        // losing the mapping.
+                        if let Err(e) = md.merge_schema(db, table, id, &tag_keys, &field_defs).await {
+                            tracing::warn!(agent = %id, db = %db, table = %table,
+                                "merge_schema from heartbeat: {}", e);
+                        }
                     }
                 }
             }
