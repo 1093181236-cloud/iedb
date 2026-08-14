@@ -9,6 +9,7 @@ use crate::server::query_engine::QueryEngine;
 use datafusion::arrow::array::new_null_array;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::MemorySchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use futures_util::future::join_all;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -389,15 +390,47 @@ impl Federator {
 /// datafusion 40's MemorySchemaProvider rejects re-registration of an
 /// existing name, so a swap must deregister first (deregistering a name
 /// that is not registered is a no-op).
+///
+/// Two catalog quirks handled here:
+/// - deregister_table on a name whose SCHEMA was never registered fails
+///   with "failed to resolve schema" — guard with table_exist (same
+///   pattern as table_provider.rs).
+/// - register_table also requires the schema to exist; register a
+///   MemorySchemaProvider for the db first when missing (mirrors
+///   table_provider.rs::register_table_dir).
 fn swap_provider(
     engine: &QueryEngine,
     name: &str,
     provider: Arc<dyn TableProvider>,
 ) -> Result<(), String> {
-    engine
+    if engine.ctx().table_exist(name).unwrap_or(false) {
+        engine
+            .ctx()
+            .deregister_table(name)
+            .map_err(|e| format!("deregister {}: {}", name, e))?;
+    }
+    // DF 40's register_table requires the schema in the catalog: create the
+    // db schema first if it does not exist (skip if present, never overwrite).
+    let db = name
+        .split_once('.')
+        .map(|(db, _)| db)
+        .ok_or_else(|| format!("unqualified table name: {}", name))?;
+    let catalog_name = engine
         .ctx()
-        .deregister_table(name)
-        .map_err(|e| format!("deregister {}: {}", name, e))?;
+        .copied_config()
+        .options()
+        .catalog
+        .default_catalog
+        .clone();
+    let catalog = engine
+        .ctx()
+        .catalog(&catalog_name)
+        .ok_or("default catalog missing")?;
+    if !catalog.schema_names().iter().any(|s| s == db) {
+        catalog
+            .register_schema(db, Arc::new(MemorySchemaProvider::new()))
+            .map_err(|e| format!("register schema {}: {}", db, e))?;
+    }
     engine
         .ctx()
         .register_table(name, provider)
@@ -919,6 +952,64 @@ mod tests_federation {
         let r = engine.query("SELECT * FROM metrics.cpu", QueryMode::Buffer, Some(&f)).await.unwrap();
         assert_eq!(r["returned_rows"], 3);
         assert_eq!(r["rows"][0]["time"], 4000, "buffer-only must exclude parquet rows");
+    }
+
+    /// Buffer mode on a BRAND-NEW table (no parquet written, no listing,
+    /// schema never registered in the catalog). swap_provider must not
+    /// choke on the missing schema — regression for live ARM32:
+    /// "deregister fed3.test: Error during planning: failed to resolve
+    /// schema: fed3".
+    #[tokio::test]
+    async fn test_buffer_mode_fresh_table_no_listing() {
+        let dir = tempdir().unwrap();
+        // No write_test_parquet, no TableProvider::register_all: the
+        // metrics schema does not exist in the catalog at all.
+        let engine = QueryEngine::new(100, 10);
+
+        // Metadata: agent a1 -> metrics.fresh (agent row seeded first, as in
+        // setup(), because agent_tables has a FK on agents)
+        let db = Db::open(&dir.path().join("meta.db")).unwrap();
+        {
+            let conn = db.conn().lock().await;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            conn.execute(
+                "INSERT OR IGNORE INTO agents (id, hostname, registered_at, last_seen_at) VALUES ('a1', 'mock', ?1, ?1)",
+                rusqlite::params![now_ms],
+            )
+            .unwrap();
+        }
+        let metadata = Arc::new(MetadataStore::new(Arc::new(db)));
+        metadata
+            .merge_schema(
+                "metrics",
+                "fresh",
+                "a1",
+                &["host".to_string()],
+                &[("v".to_string(), "F64".to_string())],
+            )
+            .await
+            .unwrap();
+
+        let federator = Federator {
+            agent_store: Arc::new(AgentStore::new(Arc::new(Db::open(&dir.path().join("agents.db")).unwrap()))),
+            metadata,
+            client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap(),
+            lock: RwLock::new(()),
+        };
+        let addr = spawn_mock_agent(buffer_parquet_bytes()).await;
+        register_agent(&federator, &addr).await;
+
+        let r = engine
+            .query("SELECT COUNT(*) AS c FROM metrics.fresh", QueryMode::Buffer, Some(&federator))
+            .await
+            .unwrap();
+        assert_eq!(r["rows"][0]["c"], 3, "buffer rows on a fresh table must count, got: {}", r);
+        assert_eq!(r["federated"], true);
+        assert_eq!(r["agents_queried"], 1);
+
+        // The transient registration must not linger in the catalog.
+        assert!(!engine.ctx().table_exist("metrics.fresh").unwrap_or(false),
+            "transient provider must be restored (removed) after planning");
     }
 
     #[tokio::test]
