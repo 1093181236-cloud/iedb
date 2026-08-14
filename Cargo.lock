@@ -2138,6 +2138,7 @@ name = "iedb"
 version = "0.1.0"
 dependencies = [
  "arrow 53.4.1",
+ "async-trait",
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",
