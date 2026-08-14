@@ -2160,6 +2160,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "sqlparser",
  "tempfile",
  "tokio",
  "toml",

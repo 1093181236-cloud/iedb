@@ -8,7 +8,7 @@ default = ["mix"]
 agent = ["dep:parquet", "dep:bitcode", "dep:influxdb-line-protocol",
          "dep:reqwest", "dep:aws-sigv4", "dep:aws-credential-types", "dep:aws-smithy-runtime-api",
          "dep:crc32fast", "dep:rust-embed"]
-server = ["dep:datafusion", "dep:arrow", "dep:object_store", "dep:rusqlite", "dep:parquet", "dep:rust-embed"]
+server = ["dep:datafusion", "dep:arrow", "dep:object_store", "dep:rusqlite", "dep:parquet", "dep:rust-embed", "dep:reqwest", "dep:sqlparser"]
 mix = ["agent", "server"]
 
 [dependencies]
@@ -44,6 +44,7 @@ datafusion = { version = "40", optional = true }
 arrow = { version = "53", optional = true }
 object_store = { version = "0.11", optional = true }
 rusqlite = { version = "0.31", optional = true, features = ["bundled"] }
+sqlparser = { version = "0.47", optional = true }
 rust-embed = { version = "8", optional = true }
 
 [dev-dependencies]
