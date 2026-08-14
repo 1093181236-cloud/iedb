@@ -212,6 +212,27 @@ check_eq "$(echo "$SQL" | python3 -c "import sys,json; print(json.load(sys.stdin
 AGG=$(curl -sf -X POST "http://127.0.0.1:18080/api/v1/query" -H "Content-Type: application/json" -d '{"sql":"SELECT COUNT(*) AS cnt, AVG(cpu) AS avg_cpu FROM mydb.cpu"}')
 check_eq "$(echo "$AGG" | python3 -c "import sys,json; print(json.load(sys.stdin)['rows'][0]['cnt'])")" "3" "SQL: COUNT(*)=3"
 
+# ── Query Federation ──────────────────────────────────────────────────────
+echo ""
+echo "=== Query Federation ==="
+
+# mode=history: default, no federation fields
+R=$(curl -s -X POST "$SERVER_URL/api/v1/query" -d '{"sql":"SELECT COUNT(*) AS c FROM mydb.cpu","mode":"history"}')
+check_ok "$(echo "$R" | jq -e '.rows' >/dev/null 2>&1 && echo ok || echo fail)" "history mode query"
+check_ok "$(echo "$R" | jq -e '.rows[0].c >= 0' >/dev/null 2>&1 && echo ok || echo fail)" "history mode returns rows"
+
+# mode=buffer: agent buffer data (rows written but not yet snapshotted)
+R=$(curl -s -X POST "$SERVER_URL/api/v1/query" -d '{"sql":"SELECT COUNT(*) AS c FROM mydb.cpu","mode":"buffer"}')
+check_ok "$(echo "$R" | jq -e '.rows' >/dev/null 2>&1 && echo ok || echo fail)" "buffer mode query"
+check_ok "$(echo "$R" | jq -e '.federated == true' >/dev/null 2>&1 && echo ok || echo fail)" "buffer mode has federated flag"
+check_ok "$(echo "$R" | jq -e '.agents_queried >= 0' >/dev/null 2>&1 && echo ok || echo fail)" "buffer mode has agents_queried"
+
+# mode=all: union of parquet + buffer
+R=$(curl -s -X POST "$SERVER_URL/api/v1/query" -d '{"sql":"SELECT COUNT(*) AS c FROM mydb.cpu","mode":"all"}')
+check_ok "$(echo "$R" | jq -e '.rows' >/dev/null 2>&1 && echo ok || echo fail)" "all mode query"
+check_ok "$(echo "$R" | jq -e '.federated == true' >/dev/null 2>&1 && echo ok || echo fail)" "all mode has federated flag"
+check_ok "$(echo "$R" | jq -e '.agents_skipped >= 0' >/dev/null 2>&1 && echo ok || echo fail)" "all mode has agents_skipped"
+
 # ── 9. Metadata ──
 info "9. Metadata"
 check_ge "$(curl -sf "http://127.0.0.1:18080/api/v1/metadata/databases" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['databases']))")" "2" "metadata: >=2 databases"
