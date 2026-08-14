@@ -29,7 +29,10 @@ http-body-util = "0.1"
 http = "1"
 
 # agent feature 依赖
-parquet = { version = "53", optional = true, default-features = false, features = ["snap", "flate2"] }
+# pinned to 52 (same as datafusion 40's parquet) so its arrow reader
+# produces the same arrow-52 RecordBatch type datafusion::arrow uses,
+# and its features unify with datafusion's parquet (arrow reader included)
+parquet = { version = "52", optional = true, default-features = false, features = ["snap", "flate2"] }
 bitcode = { version = "0.6", optional = true, features = ["serde"] }
 influxdb-line-protocol = { version = "1.0", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json"] }

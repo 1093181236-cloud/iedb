@@ -1211,7 +1211,7 @@ dependencies = [
  "num_cpus",
  "object_store 0.10.2",
  "parking_lot",
- "parquet 52.2.0",
+ "parquet",
  "paste",
  "pin-project-lite",
  "rand 0.8.7",
@@ -1243,7 +1243,7 @@ dependencies = [
  "libc",
  "num_cpus",
  "object_store 0.10.2",
- "parquet 52.2.0",
+ "parquet",
  "sqlparser",
 ]
 
@@ -2155,7 +2155,7 @@ dependencies = [
  "hyper-util",
  "influxdb-line-protocol",
  "object_store 0.11.2",
- "parquet 53.4.1",
+ "parquet",
  "reqwest",
  "rusqlite",
  "rust-embed",
@@ -2764,27 +2764,6 @@ dependencies = [
  "twox-hash 1.6.3",
  "zstd",
  "zstd-sys",
-]
-
-[[package]]
-name = "parquet"
-version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f8cf58b29782a7add991f655ff42929e31a7859f5319e53db9e39a714cb113c"
-dependencies = [
- "ahash",
- "bytes",
- "chrono",
- "flate2",
- "half",
- "hashbrown 0.15.5",
- "num",
- "num-bigint",
- "paste",
- "seq-macro",
- "snap",
- "thrift",
- "twox-hash 1.6.3",
 ]
 
 [[package]]

@@ -163,9 +163,11 @@ fn read_parquet_stats(path: &Path) -> Result<(i64, i64, usize, Vec<(String, Stri
             let col_path = col_desc.path().string();
             if col_path == "time" {
                 if let Some(stats) = col.statistics() {
-                    if let (Some(min), Some(max)) = (stats.min_bytes_opt(), stats.max_bytes_opt()) {
-                        let min_val = i64::from_le_bytes(min.try_into().unwrap_or([0; 8]));
-                        let max_val = i64::from_le_bytes(max.try_into().unwrap_or([0; 8]));
+                    // parquet 52 API: min_bytes()/max_bytes() panic when unset,
+                    // so guard with has_min_max_set() (min_bytes_opt is 53+)
+                    if stats.has_min_max_set() {
+                        let min_val = i64::from_le_bytes(stats.min_bytes().try_into().unwrap_or([0; 8]));
+                        let max_val = i64::from_le_bytes(stats.max_bytes().try_into().unwrap_or([0; 8]));
                         time_min = time_min.min(min_val);
                         time_max = time_max.max(max_val);
                     }
