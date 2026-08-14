@@ -81,7 +81,16 @@ pub async fn run_server(config: Arc<Config>, include_agent_api: bool) -> Result<
         max_body_bytes: config.server.max_body_bytes as usize,
         engine: Some(engine.clone()),
     });
-    let sql_api = Arc::new(SqlApiHandler { engine: engine.clone(), data_dir: query_cfg.data_dir.clone(), federator: None });
+    let federator = Arc::new(crate::server::federation::Federator {
+        agent_store: agent_store.clone(),
+        metadata: metadata.clone(),
+        client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .map_err(|e| format!("http client: {}", e))?,
+        lock: tokio::sync::Mutex::new(()),
+    });
+    let sql_api = Arc::new(SqlApiHandler { engine: engine.clone(), data_dir: query_cfg.data_dir.clone(), federator: Some(federator) });
     let metadata_api = Arc::new(MetadataApiHandler {
         store: metadata.clone(),
     });
