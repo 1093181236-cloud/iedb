@@ -658,3 +658,185 @@ mod tests {
         );
     }
 }
+
+// End-to-end federation tests: real QueryEngine + real Federator + a mock
+// agent HTTP server, proving the three modes return correct merged data.
+#[cfg(test)]
+mod tests_federation {
+    use super::*;
+    use crate::server::db::Db;
+    use crate::server::query_engine::QueryEngine;
+    use crate::server::table_provider::TableProvider as Reg;
+    use crate::server::test_util::write_test_parquet;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use std::net::SocketAddr;
+    use tempfile::tempdir;
+
+    /// Buffer rows served by the mock agent: time 4000..4002, usage 4.5/5.5/6.5.
+    /// Written with the server-side parquet writer (the `agent` module is not
+    /// compiled under `--features server`): schema time + host (tag) + usage,
+    /// matching what the agent's flush_chunks_to_parquet would produce.
+    fn buffer_parquet_bytes() -> Vec<u8> {
+        use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("time", DataType::Int64, false),
+            Field::new("host", DataType::Utf8, true),
+            Field::new("usage", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![4000i64, 4001, 4002])),
+                Arc::new(StringArray::from(vec!["srv01", "srv01", "srv01"])),
+                Arc::new(Float64Array::from(vec![4.5f64, 5.5, 6.5])),
+            ],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        buf
+    }
+
+    /// Spawn a mock agent on an ephemeral port returning the given bytes.
+    async fn spawn_mock_agent(bytes: Vec<u8>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await { Ok(x) => x, Err(_) => return };
+                let bytes = bytes.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |_req| {
+                        let b = bytes.clone();
+                        async move {
+                            Ok::<_, std::convert::Infallible>(hyper::Response::builder()
+                                .status(200)
+                                .header("Content-Type", "application/octet-stream")
+                                .body(http_body_util::Full::new(bytes::Bytes::from(b))).unwrap())
+                        }
+                    });
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new()).serve_connection(io, svc).await;
+                });
+            }
+        });
+        addr
+    }
+
+    async fn setup() -> (tempfile::TempDir, QueryEngine, Federator) {
+        let dir = tempdir().unwrap();
+        // Persisted parquet: 3 rows time 1000..3000 usage 1.5/2.5/3.5
+        let table_dir = dir.path().join("metrics").join("cpu");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        write_test_parquet(&table_dir.join("a.parquet"));
+
+        let engine = QueryEngine::new(100, 10);
+        Reg::register_all(&engine, dir.path()).await.unwrap();
+
+        // Metadata: agent a1 -> metrics.cpu
+        let db = Db::open(&dir.path().join("meta.db")).unwrap();
+        // agent_tables.agent_id has REFERENCES agents(id) with
+        // foreign_keys=ON, and merge_schema swallows the insert error — so
+        // the mapping is silently dropped unless the agent row exists in the
+        // metadata DB first. Seed it (the federator's agent_store still uses
+        // its own separate agents.db, per the brief's setup).
+        {
+            let conn = db.conn().lock().await;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            conn.execute(
+                "INSERT OR IGNORE INTO agents (id, hostname, registered_at, last_seen_at) VALUES ('a1', 'mock', ?1, ?1)",
+                rusqlite::params![now_ms],
+            )
+            .unwrap();
+        }
+        let metadata = Arc::new(MetadataStore::new(Arc::new(db)));
+        let _ = metadata.merge_schema("metrics", "cpu", "a1",
+            &["host".to_string()],
+            &[("usage".to_string(), "F64".to_string())]).await;
+
+        let federator = Federator {
+            agent_store: Arc::new(AgentStore::new(Arc::new(Db::open(&dir.path().join("agents.db")).unwrap()))),
+            metadata,
+            client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap(),
+            lock: Mutex::new(()),
+        };
+        (dir, engine, federator)
+    }
+
+    async fn register_agent(f: &Federator, addr: &SocketAddr) {
+        let _ = f.agent_store.register("a1", "mock", "x86", "0.1.0", &format!("{}", addr)).await;
+        let _ = f.agent_store.heartbeat("a1", 1).await;
+    }
+
+    #[tokio::test]
+    async fn test_history_mode_no_federation() {
+        let (_dir, engine, f) = setup().await;
+        let r = engine.query("SELECT * FROM metrics.cpu", QueryMode::History, Some(&f)).await.unwrap();
+        assert_eq!(r["returned_rows"], 3);
+        assert!(r.get("federated").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_all_mode_unions_buffer_and_parquet() {
+        let (_dir, engine, f) = setup().await;
+        let addr = spawn_mock_agent(buffer_parquet_bytes()).await;
+        register_agent(&f, &addr).await;
+
+        let r = engine.query("SELECT * FROM metrics.cpu", QueryMode::All, Some(&f)).await.unwrap();
+        assert_eq!(r["returned_rows"], 6, "3 parquet + 3 buffer rows; got: {}", r);
+        assert_eq!(r["federated"], true);
+        assert_eq!(r["agents_queried"], 1);
+        assert_eq!(r["agents_skipped"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_all_mode_aggregate_includes_buffer() {
+        let (_dir, engine, f) = setup().await;
+        let addr = spawn_mock_agent(buffer_parquet_bytes()).await;
+        register_agent(&f, &addr).await;
+
+        let r = engine.query("SELECT COUNT(*) AS cnt, MAX(time) AS mx FROM metrics.cpu", QueryMode::All, Some(&f)).await.unwrap();
+        assert_eq!(r["rows"][0]["cnt"], 6);
+        assert_eq!(r["rows"][0]["mx"], 4002);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_mode_only_memory() {
+        let (_dir, engine, f) = setup().await;
+        let addr = spawn_mock_agent(buffer_parquet_bytes()).await;
+        register_agent(&f, &addr).await;
+
+        let r = engine.query("SELECT * FROM metrics.cpu", QueryMode::Buffer, Some(&f)).await.unwrap();
+        assert_eq!(r["returned_rows"], 3);
+        assert_eq!(r["rows"][0]["time"], 4000, "buffer-only must exclude parquet rows");
+    }
+
+    #[tokio::test]
+    async fn test_offline_agent_skipped() {
+        let (_dir, engine, f) = setup().await;
+        // Agent "a1" registered in metadata but no agent row → offline → skipped
+        let r = engine.query("SELECT * FROM metrics.cpu", QueryMode::All, Some(&f)).await.unwrap();
+        assert_eq!(r["returned_rows"], 3, "only parquet data");
+        assert_eq!(r["agents_skipped"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_time_pushdown_passed_to_agent() {
+        let (_dir, engine, f) = setup().await;
+        let addr = spawn_mock_agent(buffer_parquet_bytes()).await;
+        register_agent(&f, &addr).await;
+
+        // WHERE time <= 1500: the mock agent ignores start/end and returns all
+        // buffer rows, but DataFusion re-applies the WHERE after the union —
+        // only the parquet row at time=1000 survives. cnt must be 1.
+        let r = engine.query("SELECT COUNT(*) AS cnt FROM metrics.cpu WHERE time <= 1500", QueryMode::All, Some(&f)).await.unwrap();
+        assert_eq!(r["rows"][0]["cnt"], 1);
+    }
+}
