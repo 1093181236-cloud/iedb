@@ -17,7 +17,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 /// Extract qualified `db.table` references from a SQL statement.
 /// Returns (db, table) pairs in first-appearance order.
@@ -123,7 +123,12 @@ pub struct Federator {
     pub agent_store: Arc<AgentStore>,
     pub metadata: Arc<MetadataStore>,
     pub client: reqwest::Client,
-    pub lock: Mutex<()>,
+    /// Write-locked during prepare_and_plan (provider registration +
+    /// planning); History queries take a read lock through planning so a
+    /// concurrent federation pass cannot swap providers mid-plan, while
+    /// multiple history queries (or non-federated planning) proceed
+    /// concurrently.
+    pub lock: RwLock<()>,
 }
 
 impl Federator {
@@ -132,6 +137,14 @@ impl Federator {
     /// query cannot swap providers between registration and planning.
     /// Execution happens after the lock is released (the DataFrame owns
     /// Arc references to its providers).
+    ///
+    /// The returned `outcome` is `Some` whenever the SQL references
+    /// qualified `db.table` tables — i.e. a fetch was ATTEMPTED —
+    /// regardless of whether any agent was reachable or returned data.
+    /// Consequently `federated: true` in the query response means a fetch
+    /// was attempted, NOT that rows were merged; an offline/empty fleet
+    /// still reports `federated: true` with an empty (Buffer) or
+    /// persisted-only (All) result set.
     pub async fn prepare_and_plan(
         &self,
         engine: &QueryEngine,
@@ -144,7 +157,7 @@ impl Federator {
             return Ok((None, df));
         }
 
-        let _guard = self.lock.lock().await;
+        let _guard = self.lock.write().await;
         // The time range is per-SQL, not per-table: extract once.
         let (start_ns, end_ns) = engine_time_range(engine, sql);
         let mut queried = 0usize;
@@ -227,7 +240,6 @@ impl Federator {
                     match resp {
                         Ok(r) if r.status() == 204 => {} // empty buffer, fine
                         Ok(r) if r.status().is_success() => {
-                            queried += 1;
                             let bytes = match r.bytes().await {
                                 Ok(b) => b,
                                 Err(e) => {
@@ -237,7 +249,13 @@ impl Federator {
                                 }
                             };
                             match parquet_bytes_to_batches(bytes).await {
-                                Ok(bs) => batches.extend(bs),
+                                Ok(bs) => {
+                                    // Count only after a successful body read
+                                    // AND parquet decode; a failed decode
+                                    // counts as skipped, not queried.
+                                    queried += 1;
+                                    batches.extend(bs);
+                                }
                                 Err(e) => {
                                     tracing::warn!(agent = %addr, "parquet decode: {}", e);
                                     skipped += 1;
@@ -388,7 +406,10 @@ fn swap_provider(
 }
 
 fn build_fetch_url(addr: &str, db: &str, table: &str, start: Option<i64>, end: Option<i64>) -> String {
-    let mut url = format!("http://{}/api/v1/query/parquet?db={}&table={}", addr, db, table);
+    // db/table can contain characters that need percent-encoding (spaces,
+    // slashes, non-ASCII); encode both before splicing into the query.
+    let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+    let mut url = format!("http://{}/api/v1/query/parquet?db={}&table={}", addr, enc(db), enc(table));
     if let Some(s) = start {
         url.push_str(&format!("&start={}", s));
     }
@@ -692,7 +713,7 @@ mod tests {
             agent_store,
             metadata,
             client: reqwest::Client::new(),
-            lock: Mutex::new(()),
+            lock: RwLock::new(()),
         };
         let (outcome, _df) = federator
             .prepare_and_plan(&engine, "SELECT * FROM metrics.cpu", QueryMode::Buffer)
@@ -847,7 +868,7 @@ mod tests_federation {
             agent_store: Arc::new(AgentStore::new(Arc::new(Db::open(&dir.path().join("agents.db")).unwrap()))),
             metadata,
             client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap(),
-            lock: Mutex::new(()),
+            lock: RwLock::new(()),
         };
         (dir, engine, federator)
     }

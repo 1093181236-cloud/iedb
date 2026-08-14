@@ -88,7 +88,7 @@ pub async fn run_server(config: Arc<Config>, include_agent_api: bool) -> Result<
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .map_err(|e| format!("http client: {}", e))?,
-        lock: tokio::sync::Mutex::new(()),
+        lock: tokio::sync::RwLock::new(()),
     });
     let sql_api = Arc::new(SqlApiHandler { engine: engine.clone(), data_dir: query_cfg.data_dir.clone(), federator: Some(federator) });
     let metadata_api = Arc::new(MetadataApiHandler {

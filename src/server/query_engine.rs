@@ -67,10 +67,23 @@ impl QueryEngine {
                             .map_err(|e| format!("SQL error: {}", e))?
                     }
                 } else {
-                    self.ctx
-                        .sql(sql)
-                        .await
-                        .map_err(|e| format!("SQL error: {}", e))?
+                    // History mode registers nothing, but holding the
+                    // federation READ lock through planning keeps a
+                    // concurrent federation pass from swapping providers
+                    // mid-plan; the guard drops at the end of this block,
+                    // before collect runs.
+                    if let Some(f) = federator {
+                        let _read = f.lock.read().await;
+                        self.ctx
+                            .sql(sql)
+                            .await
+                            .map_err(|e| format!("SQL error: {}", e))?
+                    } else {
+                        self.ctx
+                            .sql(sql)
+                            .await
+                            .map_err(|e| format!("SQL error: {}", e))?
+                    }
                 };
 
                 // 应用 LIMIT 防止大结果集

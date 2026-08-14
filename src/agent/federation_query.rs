@@ -36,23 +36,27 @@ impl FederationQueryHandler {
         let start_ns = get("start").and_then(|s| s.parse::<i64>().ok());
         let end_ns = get("end").and_then(|s| s.parse::<i64>().ok());
 
-        // Serialize under the buffer lock; chunks are &-referenced briefly.
-        let buf = self.buffer.lock().await;
-        let table = match buf.get_table(&db, &table_name) {
-            Some(t) => t,
-            None => return Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(b"{\"error\":\"table not found\"}".to_vec())
-                .expect("valid response")),
+        // Hold the buffer lock only long enough to CLONE the table and
+        // decide whether any row falls in range; parquet serialization runs
+        // after the guard is dropped so writes are not blocked for the
+        // whole serialization.
+        let (table, any_rows) = {
+            let buf = self.buffer.lock().await;
+            let t = match buf.get_table(&db, &table_name) {
+                Some(t) => t,
+                None => return Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(b"{\"error\":\"table not found\"}".to_vec())
+                    .expect("valid response")),
+            };
+            // 204 No Content when the buffer has nothing for this range
+            let any_rows = t.chunks.iter().any(|c| {
+                c.rows.iter().any(|r| {
+                    start_ns.map_or(true, |s| r.time >= s) && end_ns.map_or(true, |e| r.time <= e)
+                })
+            });
+            (t.clone(), any_rows)
         };
-        let chunk_refs: Vec<&crate::agent::buffer::chunk::Chunk> = table.chunks.iter().collect();
-
-        // 204 No Content when the buffer has nothing for this range
-        let any_rows = chunk_refs.iter().any(|c| {
-            c.rows.iter().any(|r| {
-                start_ns.map_or(true, |s| r.time >= s) && end_ns.map_or(true, |e| r.time <= e)
-            })
-        });
         if !any_rows {
             return Ok(Response::builder()
                 .status(StatusCode::NO_CONTENT)
@@ -60,8 +64,9 @@ impl FederationQueryHandler {
                 .expect("valid response"));
         }
 
+        let chunk_refs: Vec<&crate::agent::buffer::chunk::Chunk> = table.chunks.iter().collect();
         match crate::agent::flush::parquet_writer::flush_chunks_to_parquet(
-            table, &chunk_refs, start_ns, end_ns,
+            &table, &chunk_refs, start_ns, end_ns,
         ) {
             Ok(bytes) => Ok(Response::builder()
                 .status(StatusCode::OK)
