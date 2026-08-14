@@ -118,7 +118,10 @@ mod server_tests {
             // Config 是纯 owned 数据，可安全移入 'static 任务
             let config = make_config(dir, port);
             let handle = tokio::spawn(async move {
-                let _ = run_server(config, false).await;
+                // include_agent_api=true: the test's agent-API section
+                // (register/list/heartbeat/config) exercises the full server
+                // surface. mix-404 behavior stays covered by shell e2e.
+                let _ = run_server(config, true).await;
             });
 
             for _ in 0..100 {
