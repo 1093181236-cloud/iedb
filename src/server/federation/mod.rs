@@ -69,16 +69,14 @@ pub fn extract_table_names(sql: &str) -> Result<Vec<(String, String)>, String> {
     }
 
     fn walk_query(q: &sqlparser::ast::Query, ctes: &[String], tables: &mut Vec<(String, String)>) {
+        let mut all_ctes = ctes.to_vec();
         if let Some(with) = &q.with {
             for cte in &with.cte_tables {
-                let mut all_ctes = ctes.to_vec();
                 all_ctes.push(cte.alias.name.value.clone());
                 walk_query(&cte.query, &all_ctes, tables);
-                // CTE body tables are in scope at the outer level too (recursion aside)
-                walk_set_expr(&q.body, &all_ctes, tables);
             }
         }
-        walk_set_expr(&q.body, ctes, tables);
+        walk_set_expr(&q.body, &all_ctes, tables);
     }
 
     for stmt in stmts {
@@ -121,6 +119,27 @@ mod tests {
             "CTE named cpu must not be mistaken for mydb.cpu; got {:?}", t);
         assert!(t.contains(&("otherdb".to_string(), "src".to_string())));
         assert!(t.contains(&("mydb".to_string(), "real".to_string())));
+    }
+
+    #[test]
+    fn test_cte_shadowed_qualified_main_body() {
+        let t = extract_table_names(
+            "WITH cpu AS (SELECT * FROM otherdb.src) SELECT * FROM mydb.cpu",
+        )
+        .unwrap();
+        assert!(t.contains(&("otherdb".to_string(), "src".to_string())));
+        assert!(!t.contains(&("mydb".to_string(), "cpu".to_string())),
+            "qualified mydb.cpu must not be collected while cpu is CTE-shadowed; got {:?}", t);
+    }
+
+    #[test]
+    fn test_cte_shadowed_multiple_ctes() {
+        let t = extract_table_names(
+            "WITH a AS (SELECT 1), b AS (SELECT 1) SELECT * FROM mydb.b",
+        )
+        .unwrap();
+        assert!(!t.contains(&("mydb".to_string(), "b".to_string())),
+            "CTE-shadowed mydb.b must not be collected; got {:?}", t);
     }
 
     #[test]
