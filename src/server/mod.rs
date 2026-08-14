@@ -8,6 +8,7 @@ pub mod metadata_store;
 pub mod table_provider;
 pub mod compaction;
 pub mod db;
+pub mod federation;
 
 #[cfg(test)]
 mod test_util;
