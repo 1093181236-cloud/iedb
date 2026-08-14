@@ -49,6 +49,13 @@ impl IngestApiHandler {
             .find(|(k, _)| k == "measurement")
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "unknown".into());
+        // Optional chunk_time (ns): makes the filename deterministic across
+        // upload retries, so a re-upload of the same chunk set is idempotent.
+        // Absent → fall back to server time (backward compat with old agents).
+        let chunk_time = query
+            .iter()
+            .find(|(k, _)| k == "chunk_time")
+            .and_then(|(_, v)| v.parse::<i64>().ok());
 
         // 防止路径穿越：db/table 只允许单段名称
         if !is_safe_segment(&db) || !is_safe_segment(&table) {
@@ -85,9 +92,20 @@ impl IngestApiHandler {
             return Ok(json_err(500, &format!("mkdir: {}", e)));
         }
 
-        let chunk_time = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let chunk_time = chunk_time
+            .or_else(|| chrono::Utc::now().timestamp_nanos_opt())
+            .unwrap_or(0);
         let filename = format!("{}_{}.parquet", agent_id, chunk_time);
         let filepath = table_dir.join(&filename);
+
+        // Idempotence: a retry of the same chunk (staging re-upload after a
+        // lost response) hits the same filename. The data is already on disk,
+        // so skip the write AND the stats accumulation — otherwise
+        // total_rows would double-count the same rows.
+        if filepath.exists() {
+            tracing::info!(path = %filepath.display(), "Duplicate ingest skipped (already exists)");
+            return Ok(Response::builder().status(200).body("ok".into()).unwrap());
+        }
 
         if let Err(e) = std::fs::write(&filepath, &body) {
             return Ok(json_err(500, &format!("write: {}", e)));
@@ -297,6 +315,59 @@ mod tests {
         assert_eq!(detail.fields.len(), 1);
         assert_eq!(detail.fields[0].name, "usage");
         assert_eq!(detail.fields[0].value_type, "DOUBLE");
+    }
+
+    #[tokio::test]
+    async fn test_upload_uses_chunk_time_in_filename() {
+        let (_dir, h) = test_handler();
+
+        let resp = h
+            .handle(upload_req(
+                "/api/v1/ingest/parquet?db=metrics&measurement=cpu&chunk_time=1700000000000000000",
+                make_test_parquet(),
+                "agent-1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let files: Vec<_> = std::fs::read_dir(h.data_dir.join("metrics").join("cpu"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], "agent-1_1700000000000000000.parquet",
+            "filename must use the agent-provided chunk_time");
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_upload_is_idempotent() {
+        let (_dir, h) = test_handler();
+
+        let uri = "/api/v1/ingest/parquet?db=metrics&measurement=cpu&chunk_time=1700000000000000000";
+        let first = h
+            .handle(upload_req(uri, make_test_parquet(), "agent-1"))
+            .await
+            .unwrap();
+        assert_eq!(first.status().as_u16(), 200);
+
+        // Retry of the same chunk (e.g. response lost, staging re-upload)
+        let second = h
+            .handle(upload_req(uri, make_test_parquet(), "agent-1"))
+            .await
+            .unwrap();
+        assert_eq!(second.status().as_u16(), 200);
+
+        // One file on disk
+        let files: Vec<_> = std::fs::read_dir(h.data_dir.join("metrics").join("cpu"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 1, "duplicate chunk_time must not stack files");
+
+        // Stats counted exactly once
+        let detail = h.metadata.get_table("metrics", "cpu").await.unwrap().unwrap();
+        assert_eq!(detail.row_count, 3, "duplicate upload must not double-count stats");
     }
 
     #[tokio::test]
