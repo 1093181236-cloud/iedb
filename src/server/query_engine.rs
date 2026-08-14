@@ -37,6 +37,15 @@ impl QueryEngine {
                     Ok((o, df)) => { outcome = o; df }
                     Err(e) => {
                         tracing::warn!("federation prepare failed: {}", e);
+                        if mode == crate::server::federation::QueryMode::Buffer {
+                            // Buffer mode must never fall back to plain SQL:
+                            // the fallback binds to persisted providers and
+                            // leaks history into the buffer-only result set.
+                            // Surface the federation error instead (when no
+                            // referenced table is registered the fallback
+                            // would fail identically, so this is safe).
+                            return Err(e);
+                        }
                         self.ctx
                             .sql(sql)
                             .await

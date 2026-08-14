@@ -38,8 +38,15 @@ impl SqlApiHandler {
                 .header("Content-Type", "application/json")
                 .body(result.to_string())
                 .unwrap()),
-            Err(e) if e.contains("table") && e.contains("not found") => {
-                // 表尚未注册：尝试从 data_dir 按需注册
+            Err(e)
+                if mode != crate::server::federation::QueryMode::Buffer
+                    && e.contains("table")
+                    && e.contains("not found") =>
+            {
+                // 表尚未注册：尝试从 data_dir 按需注册。
+                // Buffer mode 必须绕过：register_all 会把持久化表挂进
+                // catalog，重试会让 buffer-only 查询看到历史 Parquet 行。
+                // Buffer mode 的错误直接以 422 透传。
                 use crate::server::table_provider::TableProvider;
                 if let Err(re) = TableProvider::register_all(&self.engine, &self.data_dir).await {
                     tracing::warn!("Lazy table registration failed: {}", re);

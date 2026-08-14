@@ -169,6 +169,10 @@ impl Federator {
                     }
                 };
                 if agent_ids.is_empty() {
+                    // No agents contribute this table: in Buffer mode the
+                    // listing must not leak persisted rows into the result.
+                    self.shadow_empty_in_buffer(engine, &qualified, &mut replaced, mode)
+                        .await?;
                     continue;
                 }
 
@@ -193,6 +197,10 @@ impl Federator {
                     }
                 }
                 if targets.is_empty() {
+                    // All agents offline / unreachable: in Buffer mode the
+                    // listing must not leak persisted rows into the result.
+                    self.shadow_empty_in_buffer(engine, &qualified, &mut replaced, mode)
+                        .await?;
                     continue;
                 }
 
@@ -247,12 +255,16 @@ impl Federator {
                     }
                 }
 
-                // No data fetched for this table: leave whatever provider is
-                // currently registered (the persisted listing, or a previous
-                // registration). In buffer-only mode with no persisted data,
-                // planning below fails with "table not found", which the
-                // caller surfaces as a normal SQL error.
+                // No data fetched for this table. All mode keeps whatever
+                // provider is registered (the persisted listing — Parquet-only
+                // degradation is in-spec there). Buffer mode must never leak
+                // persisted rows: shadow the listing with an empty transient
+                // provider, or leave the table unregistered when no listing
+                // exists (planning then fails with "table not found", which
+                // the caller surfaces as a normal SQL error).
                 if batches.is_empty() {
+                    self.shadow_empty_in_buffer(engine, &qualified, &mut replaced, mode)
+                        .await?;
                     continue;
                 }
 
@@ -273,16 +285,25 @@ impl Federator {
                             }
                         };
                         let schema = listing.schema();
-                        let aligned = align_to_schema(&batches, &schema)?;
+                        let aligned = align_batches_to_schema(&batches, &schema)?;
+                        let memory = Arc::new(
+                            MemTable::try_new(schema.clone(), vec![aligned])
+                                .map_err(|e| format!("mem table: {}", e))?,
+                        );
                         let provider = provider::FederatedTableProvider {
                             listing,
-                            memory: aligned,
+                            memory,
                             schema,
                         };
                         swap_provider(engine, &qualified, Arc::new(provider))?;
                     }
                     QueryMode::Buffer => {
-                        let mem = MemTable::try_new(batches[0].schema(), vec![batches])
+                        // Agents may serve heterogeneous field sets; align all
+                        // batches to the first batch's schema so MemTable
+                        // construction cannot fail on mismatched schemas.
+                        let target = batches[0].schema();
+                        let aligned = align_batches_to_schema(&batches, &target)?;
+                        let mem = MemTable::try_new(target.clone(), vec![aligned])
                             .map_err(|e| format!("mem table: {}", e))?;
                         swap_provider(engine, &qualified, Arc::new(mem))?;
                     }
@@ -316,6 +337,33 @@ impl Federator {
 
         let df = plan_result?;
         Ok((Some(FederationOutcome { agents_queried: queried, agents_skipped: skipped }), df))
+    }
+
+    /// Buffer mode must never bind a plan to the persisted listing: when no
+    /// buffer data arrived for `qualified` (no agents registered, all
+    /// offline, or empty buffers), the listing would otherwise leak persisted
+    /// rows into the buffer-only result set. Shadow it with an empty
+    /// transient MemTable over the listing's schema; the caller's
+    /// `replaced`/restore machinery puts the original back after planning.
+    /// When nothing is registered, leave the table unregistered (planning
+    /// then surfaces "table not found" to the caller).
+    async fn shadow_empty_in_buffer(
+        &self,
+        engine: &QueryEngine,
+        qualified: &str,
+        replaced: &mut Vec<(String, Option<Arc<dyn TableProvider>>)>,
+        mode: QueryMode,
+    ) -> Result<(), String> {
+        if mode != QueryMode::Buffer {
+            return Ok(());
+        }
+        if let Ok(original) = engine.ctx().table_provider(qualified).await {
+            let empty = MemTable::try_new(original.schema(), vec![Vec::new()])
+                .map_err(|e| format!("empty mem table: {}", e))?;
+            replaced.push((qualified.to_string(), Some(original)));
+            swap_provider(engine, qualified, Arc::new(empty))?;
+        }
+        Ok(())
     }
 }
 
@@ -374,11 +422,18 @@ async fn parquet_bytes_to_batches(bytes: bytes::Bytes) -> Result<Vec<RecordBatch
 
 /// Project raw batches onto the target schema by column name.
 /// Missing columns become NULL columns; unknown columns are dropped.
+/// Returns the aligned batches, all sharing `target` as their schema.
 ///
 /// Takes the raw batches rather than a `MemTable`: datafusion 40's
 /// `MemTable` exposes no batch accessor (`batches` is `pub(crate)`), so
-/// alignment must happen before the `MemTable` is constructed.
-fn align_to_schema(batches: &[RecordBatch], target: &Schema) -> Result<Arc<MemTable>, String> {
+/// alignment must happen before the `MemTable` is constructed. Reused by
+/// both the All path (align buffer rows to the persisted listing schema)
+/// and the Buffer path (align heterogeneous agent schemas to the first
+/// batch's schema).
+fn align_batches_to_schema(
+    batches: &[RecordBatch],
+    target: &Schema,
+) -> Result<Vec<RecordBatch>, String> {
     let mut aligned = Vec::with_capacity(batches.len());
     for batch in batches {
         let mut cols = Vec::with_capacity(target.fields().len());
@@ -394,9 +449,7 @@ fn align_to_schema(batches: &[RecordBatch], target: &Schema) -> Result<Arc<MemTa
                 .map_err(|e| format!("align batch: {}", e))?,
         );
     }
-    MemTable::try_new(Arc::new(target.clone()), vec![aligned])
-        .map(|m| Arc::new(m))
-        .map_err(|e| format!("aligned mem table: {}", e))
+    Ok(aligned)
 }
 
 /// Extract the time range for pushdown from the SQL's WHERE clause.
@@ -703,6 +756,35 @@ mod tests_federation {
         buf
     }
 
+    /// Spawn a mock agent answering 204 No Content (empty buffer) — the
+    /// response a real agent gives when it has no rows in the requested
+    /// time range.
+    async fn spawn_mock_agent_204() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await { Ok(x) => x, Err(_) => return };
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |_req| {
+                        async move {
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder()
+                                    .status(204)
+                                    .body(http_body_util::Full::new(bytes::Bytes::new()))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new()).serve_connection(io, svc).await;
+                });
+            }
+        });
+        addr
+    }
+
     /// Spawn a mock agent on an ephemeral port returning the given bytes.
     async fn spawn_mock_agent(bytes: Vec<u8>) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -825,6 +907,34 @@ mod tests_federation {
         let r = engine.query("SELECT * FROM metrics.cpu", QueryMode::All, Some(&f)).await.unwrap();
         assert_eq!(r["returned_rows"], 3, "only parquet data");
         assert_eq!(r["agents_skipped"], 1);
+    }
+
+    /// Buffer mode with an unreachable agent must return an EMPTY result
+    /// set — never the persisted Parquet rows the listing would otherwise
+    /// leak into the plan.
+    #[tokio::test]
+    async fn test_buffer_mode_offline_agent_returns_empty() {
+        let (_dir, engine, f) = setup().await;
+        // a1 is in metadata but has no agent-store row → offline → no fetch
+        let r = engine.query("SELECT * FROM metrics.cpu", QueryMode::Buffer, Some(&f)).await.unwrap();
+        assert_eq!(r["returned_rows"], 0, "buffer-only with no reachable agent must be empty, got: {}", r);
+        assert_eq!(r["federated"], true);
+        assert_eq!(r["agents_skipped"], 1);
+    }
+
+    /// Buffer mode with an online agent whose buffer is empty (HTTP 204)
+    /// must return an empty result set, not the persisted Parquet rows.
+    #[tokio::test]
+    async fn test_buffer_mode_empty_buffer_returns_empty() {
+        let (_dir, engine, f) = setup().await;
+        let addr = spawn_mock_agent_204().await;
+        register_agent(&f, &addr).await;
+
+        let r = engine.query("SELECT * FROM metrics.cpu", QueryMode::Buffer, Some(&f)).await.unwrap();
+        assert_eq!(r["returned_rows"], 0, "empty agent buffer must not leak parquet rows, got: {}", r);
+        // A 204 carries no decoded rows, so it is neither queried nor skipped.
+        assert_eq!(r["agents_queried"], 0);
+        assert_eq!(r["agents_skipped"], 0);
     }
 
     #[tokio::test]
