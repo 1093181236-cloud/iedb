@@ -2,7 +2,7 @@
 // Only `time` compared to constant literals is extractable. Anything else
 // yields no bound — the caller then fetches the full buffer, which is
 // always correct because DataFusion re-applies the WHERE after the union.
-use sqlparser::ast::{BinaryOperator, Expr, Ident, Value};
+use sqlparser::ast::{BinaryOperator, Expr, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeRange {
@@ -36,9 +36,11 @@ pub fn extract_time_range(expr: &Expr) -> Option<TimeRange> {
                 }
                 let value = parse_const(right)?;
                 match op {
-                    BinaryOperator::Gt => Some(TimeRange { start_ns: Some(value + 1), end_ns: None }),
+                    // saturating: value +/- 1 at i64::MAX/MIN would panic in
+                    // debug builds; clamp instead of overflowing
+                    BinaryOperator::Gt => Some(TimeRange { start_ns: Some(value.saturating_add(1)), end_ns: None }),
                     BinaryOperator::GtEq => Some(TimeRange { start_ns: Some(value), end_ns: None }),
-                    BinaryOperator::Lt => Some(TimeRange { start_ns: None, end_ns: Some(value - 1) }),
+                    BinaryOperator::Lt => Some(TimeRange { start_ns: None, end_ns: Some(value.saturating_sub(1)) }),
                     BinaryOperator::LtEq => Some(TimeRange { start_ns: None, end_ns: Some(value) }),
                     _ => unreachable!(),
                 }
@@ -122,6 +124,28 @@ mod tests {
         let r = extract_time_range(&w).unwrap();
         assert_eq!(r.start_ns, Some(101));
         assert_eq!(r.end_ns, Some(199));
+    }
+
+    /// `time > i64::MAX` must not panic: the +1 adjustment saturates and
+    /// yields an i64::MAX start bound.
+    #[test]
+    fn test_gt_i64_max_saturates() {
+        let w = where_of("SELECT * FROM t WHERE time > 9223372036854775807");
+        let r = extract_time_range(&w).unwrap();
+        assert_eq!(r.start_ns, Some(i64::MAX));
+        assert_eq!(r.end_ns, None);
+    }
+
+    /// `time < i64::MIN` must not panic: the -1 adjustment saturates and
+    /// yields an i64::MIN end bound. (Bare `-9223372036854775808` does not
+    /// parse as a single literal, so use the quoted-string form, which
+    /// parse_const accepts.)
+    #[test]
+    fn test_lt_i64_min_saturates() {
+        let w = where_of("SELECT * FROM t WHERE time < '-9223372036854775808'");
+        let r = extract_time_range(&w).unwrap();
+        assert_eq!(r.start_ns, None);
+        assert_eq!(r.end_ns, Some(i64::MIN));
     }
 
     #[test]
