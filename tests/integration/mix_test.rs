@@ -118,7 +118,7 @@ mod server_tests {
             // Config 是纯 owned 数据，可安全移入 'static 任务
             let config = make_config(dir, port);
             let handle = tokio::spawn(async move {
-                let _ = run_server(config).await;
+                let _ = run_server(config, false).await;
             });
 
             for _ in 0..100 {
