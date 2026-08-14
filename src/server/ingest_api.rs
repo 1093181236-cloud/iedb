@@ -375,7 +375,11 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
 
         // 上传后新表立即可查询（DataFusion 表自动注册）
-        let result = engine.query("SELECT * FROM metrics.cpu").await.unwrap();
+        let result = engine.query(
+            "SELECT * FROM metrics.cpu",
+            crate::server::federation::QueryMode::History,
+            None,
+        ).await.unwrap();
         assert_eq!(result["returned_rows"], 3);
         assert_eq!(result["rows"][0]["time"], 1000);
     }

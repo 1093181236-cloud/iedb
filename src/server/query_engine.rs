@@ -22,13 +22,39 @@ impl QueryEngine {
     }
 
     /// 执行一条 SQL，返回 `{rows, truncated, returned_rows, message}`。
-    /// 结果集被 `max_rows` 截断，执行时间受 `query_timeout_secs` 限制。
-    pub async fn query(&self, sql: &str) -> Result<Value, String> {
-        let df = self
-            .ctx
-            .sql(sql)
-            .await
-            .map_err(|e| format!("SQL error: {}", e))?;
+    /// `mode`: history（仅 Parquet）/ buffer（仅 agent buffer）/ all（联合）。
+    /// `federator` 为 None 时退化为 history。
+    pub async fn query(
+        &self,
+        sql: &str,
+        mode: crate::server::federation::QueryMode,
+        federator: Option<&crate::server::federation::Federator>,
+    ) -> Result<Value, String> {
+        let mut outcome: Option<crate::server::federation::FederationOutcome> = None;
+        let df = if mode != crate::server::federation::QueryMode::History {
+            if let Some(f) = federator {
+                match f.prepare_and_plan(self, sql, mode).await {
+                    Ok((o, df)) => { outcome = o; df }
+                    Err(e) => {
+                        tracing::warn!("federation prepare failed: {}", e);
+                        self.ctx
+                            .sql(sql)
+                            .await
+                            .map_err(|e| format!("SQL error: {}", e))?
+                    }
+                }
+            } else {
+                self.ctx
+                    .sql(sql)
+                    .await
+                    .map_err(|e| format!("SQL error: {}", e))?
+            }
+        } else {
+            self.ctx
+                .sql(sql)
+                .await
+                .map_err(|e| format!("SQL error: {}", e))?
+        };
 
         // 应用 LIMIT 防止大结果集
         let df = df
@@ -60,7 +86,7 @@ impl QueryEngine {
         let total = batches.iter().map(|b| b.num_rows()).sum::<usize>();
         let truncated = total >= self.max_rows;
 
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
             "rows": rows,
             "truncated": truncated,
             "returned_rows": rows.len(),
@@ -69,7 +95,26 @@ impl QueryEngine {
             } else {
                 String::new()
             }
-        }))
+        });
+        if let Some(o) = outcome {
+            result["mode"] = serde_json::json!(mode_string(mode));
+            result["federated"] = serde_json::json!(true);
+            result["agents_queried"] = serde_json::json!(o.agents_queried);
+            result["agents_skipped"] = serde_json::json!(o.agents_skipped);
+            if o.agents_skipped > 0 {
+                result["message"] = serde_json::json!(format!(
+                    "{} agent(s) unreachable; result may be incomplete", o.agents_skipped));
+            }
+        }
+        Ok(result)
+    }
+}
+
+fn mode_string(mode: crate::server::federation::QueryMode) -> &'static str {
+    match mode {
+        crate::server::federation::QueryMode::History => "history",
+        crate::server::federation::QueryMode::Buffer => "buffer",
+        crate::server::federation::QueryMode::All => "all",
     }
 }
 
@@ -123,6 +168,7 @@ fn cell_to_json(col: &datafusion::arrow::array::ArrayRef, idx: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::federation::QueryMode;
     use crate::server::table_provider::TableProvider;
     use crate::server::test_util::write_test_parquet;
     use tempfile::tempdir;
@@ -142,7 +188,7 @@ mod tests {
         let (dir, engine) = engine_with_data(100);
         TableProvider::register_all(&engine, dir.path()).await.unwrap();
 
-        let result = engine.query("SELECT * FROM metrics.cpu").await.unwrap();
+        let result = engine.query("SELECT * FROM metrics.cpu", QueryMode::History, None).await.unwrap();
         let rows = result["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
         // 数值列输出原生 JSON 数字，而不是字符串
@@ -159,7 +205,7 @@ mod tests {
         let (dir, engine) = engine_with_data(2);
         TableProvider::register_all(&engine, dir.path()).await.unwrap();
 
-        let result = engine.query("SELECT * FROM metrics.cpu").await.unwrap();
+        let result = engine.query("SELECT * FROM metrics.cpu", QueryMode::History, None).await.unwrap();
         let rows = result["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(result["truncated"], true);
@@ -171,7 +217,7 @@ mod tests {
         let (dir, engine) = engine_with_data(100);
         TableProvider::register_all(&engine, dir.path()).await.unwrap();
 
-        let result = engine.query("SELECT COUNT(*) AS cnt, MIN(time) AS mn FROM metrics.cpu").await.unwrap();
+        let result = engine.query("SELECT COUNT(*) AS cnt, MIN(time) AS mn FROM metrics.cpu", QueryMode::History, None).await.unwrap();
         let rows = result["rows"].as_array().unwrap();
         assert_eq!(rows[0]["cnt"], 3);
         assert_eq!(rows[0]["mn"], 1000);
@@ -180,14 +226,14 @@ mod tests {
     #[tokio::test]
     async fn test_query_sql_error() {
         let engine = QueryEngine::new(100, 10);
-        let err = engine.query("SELEC broken").await.unwrap_err();
+        let err = engine.query("SELEC broken", QueryMode::History, None).await.unwrap_err();
         assert!(err.contains("SQL error"));
     }
 
     #[tokio::test]
     async fn test_query_table_not_exists_returns_error() {
         let engine = QueryEngine::new(100, 10);
-        let err = engine.query("SELECT * FROM nonexistent.table").await.unwrap_err();
+        let err = engine.query("SELECT * FROM nonexistent.table", QueryMode::History, None).await.unwrap_err();
         assert!(err.contains("SQL error"), "unexpected error: {}", err);
     }
 
@@ -197,7 +243,16 @@ mod tests {
         let engine = QueryEngine::new(100, 0); // 0 秒超时 → 立即失败
         TableProvider::register_all(&engine, dir.path()).await.unwrap();
 
-        let err = engine.query("SELECT * FROM metrics.cpu").await.unwrap_err();
+        let err = engine.query("SELECT * FROM metrics.cpu", QueryMode::History, None).await.unwrap_err();
         assert!(err.contains("timed out"), "unexpected error: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_query_history_default_mode_works_without_federator() {
+        let (dir, engine) = engine_with_data(100);
+        TableProvider::register_all(&engine, dir.path()).await.unwrap();
+        let result = engine.query("SELECT * FROM metrics.cpu", QueryMode::History, None).await.unwrap();
+        assert_eq!(result["returned_rows"], 3);
+        assert!(result.get("federated").is_none(), "history mode must not federate");
     }
 }

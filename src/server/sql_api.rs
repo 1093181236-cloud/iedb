@@ -6,6 +6,7 @@ use std::sync::Arc;
 pub struct SqlApiHandler {
     pub engine: Arc<QueryEngine>,
     pub data_dir: std::path::PathBuf,
+    pub federator: Option<Arc<crate::server::federation::Federator>>,
 }
 
 impl SqlApiHandler {
@@ -23,12 +24,15 @@ impl SqlApiHandler {
         let body = req.collect().await?.to_bytes();
         let req_data: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
         let sql = req_data["sql"].as_str().unwrap_or("");
+        let mode = crate::server::federation::parse_query_mode(
+            req_data["mode"].as_str().unwrap_or("history"),
+        );
 
         if sql.is_empty() {
             return Ok(json_err(400, "BAD_REQUEST"));
         }
 
-        match self.engine.query(sql).await {
+        match self.engine.query(sql, mode, self.federator.as_deref()).await {
             Ok(result) => Ok(Response::builder()
                 .status(200)
                 .header("Content-Type", "application/json")
@@ -41,7 +45,7 @@ impl SqlApiHandler {
                     tracing::warn!("Lazy table registration failed: {}", re);
                 }
                 // 重试一次
-                match self.engine.query(sql).await {
+                match self.engine.query(sql, mode, self.federator.as_deref()).await {
                     Ok(result) => Ok(Response::builder()
                         .status(200)
                         .header("Content-Type", "application/json")
@@ -79,6 +83,7 @@ fn status_code_to_str(s: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::federation::QueryMode;
     use crate::server::table_provider::TableProvider;
     use crate::server::test_util::{write_test_parquet, TestBody};
     use bytes::Bytes;
@@ -93,7 +98,7 @@ mod tests {
         let data_dir = dir.path().to_path_buf();
         let engine = Arc::new(QueryEngine::new(max_rows, 10));
         TableProvider::register_all(&engine, &data_dir).await.unwrap();
-        (dir, SqlApiHandler { engine, data_dir })
+        (dir, SqlApiHandler { engine, data_dir, federator: None })
     }
 
     fn json_req(method: &str, body: &str) -> Request<TestBody> {
@@ -143,5 +148,13 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 422);
         assert!(resp.body().contains("SQL error"));
+    }
+
+    #[tokio::test]
+    async fn test_mode_param_parsed() {
+        assert_eq!(crate::server::federation::parse_query_mode("buffer"), QueryMode::Buffer);
+        assert_eq!(crate::server::federation::parse_query_mode("all"), QueryMode::All);
+        assert_eq!(crate::server::federation::parse_query_mode("bogus"), QueryMode::History);
+        assert_eq!(crate::server::federation::parse_query_mode(""), QueryMode::History);
     }
 }
