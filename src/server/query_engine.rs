@@ -31,52 +31,60 @@ impl QueryEngine {
         federator: Option<&crate::server::federation::Federator>,
     ) -> Result<Value, String> {
         let mut outcome: Option<crate::server::federation::FederationOutcome> = None;
-        let df = if mode != crate::server::federation::QueryMode::History {
-            if let Some(f) = federator {
-                match f.prepare_and_plan(self, sql, mode).await {
-                    Ok((o, df)) => { outcome = o; df }
-                    Err(e) => {
-                        tracing::warn!("federation prepare failed: {}", e);
-                        if mode == crate::server::federation::QueryMode::Buffer {
-                            // Buffer mode must never fall back to plain SQL:
-                            // the fallback binds to persisted providers and
-                            // leaks history into the buffer-only result set.
-                            // Surface the federation error instead (when no
-                            // referenced table is registered the fallback
-                            // would fail identically, so this is safe).
-                            return Err(e);
+        // The timeout covers the WHOLE body: federation prepare (buffer
+        // fetches, up to 2s per agent) runs before planning, so it must be
+        // inside the budget too — otherwise the timeout only gates collect.
+        let batches = tokio::time::timeout(
+            Duration::from_secs(self.query_timeout_secs),
+            async {
+                let df = if mode != crate::server::federation::QueryMode::History {
+                    if let Some(f) = federator {
+                        match f.prepare_and_plan(self, sql, mode).await {
+                            Ok((o, df)) => { outcome = o; df }
+                            Err(e) => {
+                                tracing::warn!("federation prepare failed: {}", e);
+                                if mode == crate::server::federation::QueryMode::Buffer {
+                                    // Buffer mode must never fall back to
+                                    // plain SQL: the fallback binds to
+                                    // persisted providers and leaks history
+                                    // into the buffer-only result set.
+                                    // Surface the federation error instead
+                                    // (when no referenced table is registered
+                                    // the fallback would fail identically, so
+                                    // this is safe).
+                                    return Err(e);
+                                }
+                                self.ctx
+                                    .sql(sql)
+                                    .await
+                                    .map_err(|e| format!("SQL error: {}", e))?
+                            }
                         }
+                    } else {
                         self.ctx
                             .sql(sql)
                             .await
                             .map_err(|e| format!("SQL error: {}", e))?
                     }
-                }
-            } else {
-                self.ctx
-                    .sql(sql)
+                } else {
+                    self.ctx
+                        .sql(sql)
+                        .await
+                        .map_err(|e| format!("SQL error: {}", e))?
+                };
+
+                // 应用 LIMIT 防止大结果集
+                let df = df
+                    .limit(0, Some(self.max_rows))
+                    .map_err(|e| format!("SQL error: {}", e))?;
+
+                df.collect()
                     .await
-                    .map_err(|e| format!("SQL error: {}", e))?
-            }
-        } else {
-            self.ctx
-                .sql(sql)
-                .await
-                .map_err(|e| format!("SQL error: {}", e))?
-        };
-
-        // 应用 LIMIT 防止大结果集
-        let df = df
-            .limit(0, Some(self.max_rows))
-            .map_err(|e| format!("SQL error: {}", e))?;
-
-        let batches = tokio::time::timeout(
-            Duration::from_secs(self.query_timeout_secs),
-            df.collect(),
+                    .map_err(|e| format!("Query execution error: {}", e))
+            },
         )
         .await
-        .map_err(|_| format!("Query timed out after {}s", self.query_timeout_secs))?
-        .map_err(|e| format!("Query execution error: {}", e))?;
+        .map_err(|_| format!("Query timed out after {}s", self.query_timeout_secs))??;
 
         let mut rows = Vec::new();
         for batch in &batches {
