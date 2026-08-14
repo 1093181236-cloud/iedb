@@ -2148,6 +2148,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "datafusion",
+ "futures-util",
  "gethostname",
  "http 1.5.0",
  "http-body-util",
