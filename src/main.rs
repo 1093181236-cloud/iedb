@@ -116,7 +116,13 @@ async fn run_agent(
 
     // In mix mode (_on_local_flush is Some), skip remote registration/heartbeat
     let is_mix = _on_local_flush.is_some();
-    let listen_addr = format!("{}:{}", gethostname::gethostname().to_string_lossy(), config.server.port);
+    // [agent].listen_addr overrides the derived gethostname:port — the
+    // hostname is often unresolvable on the real network, so an explicit
+    // reachable address can be configured instead.
+    let listen_addr = match config.agent.as_ref().and_then(|a| a.listen_addr.clone()) {
+        Some(addr) => addr,
+        None => format!("{}:{}", gethostname::gethostname().to_string_lossy(), config.server.port),
+    };
     let agent_client = if is_mix { None } else { Some(Arc::new(AgentClient::new(config.clone(), listen_addr))) };
 
     let mut config_version: u64 = 0;

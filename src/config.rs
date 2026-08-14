@@ -106,6 +106,11 @@ pub struct S3Config {
 pub struct AgentClientConfig {
     pub id: String,
     pub server_url: String,
+    /// Optional explicit listen address reported to the server at
+    /// registration ("host:port"). When unset, the agent derives it from
+    /// gethostname + [server].port.
+    #[serde(default)]
+    pub listen_addr: Option<String>,
 }
 
 #[cfg(feature = "server")]
@@ -422,6 +427,27 @@ mod tests {
         "#).unwrap();
         assert_eq!(config.agent.as_ref().unwrap().id, "test-agent");
         assert_eq!(config.agent.as_ref().unwrap().server_url, "http://localhost:8080");
+        // listen_addr is optional: absent by default
+        assert!(config.agent.as_ref().unwrap().listen_addr.is_none());
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_listen_addr_override() {
+        let config: Config = toml::from_str(r#"
+            [server]
+            port = 8080
+            [data]
+            dir = "/tmp/test"
+            [agent]
+            id = "test-agent"
+            server_url = "http://localhost:8080"
+            listen_addr = "10.0.0.9:18080"
+        "#).unwrap();
+        assert_eq!(
+            config.agent.as_ref().unwrap().listen_addr.as_deref(),
+            Some("10.0.0.9:18080")
+        );
     }
 
     #[cfg(feature = "server")]
