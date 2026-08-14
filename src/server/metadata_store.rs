@@ -233,6 +233,23 @@ impl MetadataStore {
             Err(e) => Err(format!("get table: {}", e)),
         }
     }
+
+    /// Return agent IDs that contribute data to the given table.
+    pub async fn list_table_agents(&self, db: &str, table: &str) -> Result<Vec<String>, String> {
+        let conn = self.db.conn().lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT at.agent_id FROM agent_tables at
+                 JOIN tables t ON t.id = at.table_id
+                 WHERE t.db_name = ?1 AND t.table_name = ?2",
+            )
+            .map_err(|e| format!("list table agents: {}", e))?;
+        let ids = stmt
+            .query_map(rusqlite::params![db, table], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("list table agents query: {}", e))?;
+        ids.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("list table agents collect: {}", e))
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +342,35 @@ mod tests {
         assert_eq!(detail.fields[0].name, "usage");
         assert_eq!(detail.fields[0].value_type, "Float");
         assert_eq!(detail.sources, vec!["agent-1".to_string(), "agent-2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_list_table_agents() {
+        // agent_tables.agent_id 有外键约束，需先注册 agent
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(Db::open(&db_path).unwrap());
+        let agents = crate::server::agent_store::AgentStore::new(db.clone());
+        agents.register("agent-1", "h1", "x86", "1.0", "10.0.0.1:8080").await.unwrap();
+        agents.register("agent-2", "h2", "arm", "1.0", "10.0.0.2:8080").await.unwrap();
+
+        let store = MetadataStore::new(db);
+        store
+            .merge_schema("metrics", "cpu", "agent-1", &["host".to_string()], &[("usage".to_string(), "Float".to_string())])
+            .await
+            .unwrap();
+        store
+            .merge_schema("metrics", "cpu", "agent-2", &["host".to_string()], &[("usage".to_string(), "Float".to_string())])
+            .await
+            .unwrap();
+
+        let ids = store.list_table_agents("metrics", "cpu").await.unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"agent-1".to_string()));
+        assert!(ids.contains(&"agent-2".to_string()));
+
+        let empty = store.list_table_agents("metrics", "nope").await.unwrap();
+        assert!(empty.is_empty());
     }
 
     #[tokio::test]
