@@ -119,6 +119,13 @@ impl IngestApiHandler {
             return Ok(Response::builder().status(200).body("ok".into()).unwrap());
         }
 
+        // Compaction tombstone: the file was merged away — its rows live in
+        // the compacted output. Re-creating it would duplicate them.
+        if self.metadata.is_tombstoned(&filename).await.unwrap_or(false) {
+            tracing::info!(path = %filepath.display(), "Ingest skipped (merged by compaction)");
+            return Ok(Response::builder().status(200).body("ok".into()).unwrap());
+        }
+
         if let Err(e) = std::fs::write(&filepath, &body) {
             return Ok(json_err(500, &format!("write: {}", e)));
         }
@@ -348,6 +355,65 @@ mod tests {
         // Both batches counted in the stats.
         let detail = h.metadata.get_table("metrics", "cpu").await.unwrap().unwrap();
         assert_eq!(detail.row_count, 6, "both batches must be counted");
+    }
+
+    /// Lost-response retry after compaction merged the file away: the tombstone
+    /// must skip the re-upload — otherwise the rows exist in both the
+    /// compacted output and the re-created file (duplicates + double stats).
+    #[tokio::test]
+    async fn test_ingest_skips_tombstoned_files() {
+        use crate::server::compaction::CompactionScheduler;
+        use crate::server::metadata_store::MetadataStore;
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let db = Arc::new(Db::open(&dir.path().join("test.db")).unwrap());
+        let metadata = Arc::new(MetadataStore::new(db.clone()));
+        let handler = IngestApiHandler {
+            data_dir: data_dir.clone(),
+            metadata: metadata.clone(),
+            engine: None,
+            max_body_bytes: 10 * 1024 * 1024,
+        };
+
+        // Two small uploads (compaction needs >1 file to merge)
+        for i in 0..2i64 {
+            let uri = format!(
+                "/api/v1/ingest/parquet?db=metrics&measurement=cpu&chunk_time={}",
+                1700000000000000000i64 + i
+            );
+            let resp = handler.handle(upload_req(&uri, make_test_parquet(), "agent-1")).await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+        }
+
+        // Compaction merges both and tombstones the originals
+        let scheduler = CompactionScheduler {
+            data_dir: data_dir.clone(),
+            metadata: metadata.clone(),
+            config: crate::config::CompactionConfig {
+                enabled: true,
+                schedule: "0 */6 * * *".into(),
+                min_file_size_mb: 1,
+                target_file_size_mb: 16,
+                max_concurrent: 2,
+            },
+        };
+        scheduler.run_once().await.unwrap();
+
+        let count_files = || {
+            std::fs::read_dir(data_dir.join("metrics").join("cpu"))
+                .unwrap()
+                .count()
+        };
+        assert_eq!(count_files(), 1, "compaction must merge both files");
+
+        // Retry of the first upload after the merge — tombstone skips it
+        let uri = "/api/v1/ingest/parquet?db=metrics&measurement=cpu&chunk_time=1700000000000000000";
+        let resp = handler.handle(upload_req(uri, make_test_parquet(), "agent-1")).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(count_files(), 1, "tombstoned retry must not re-create the file");
+
+        let detail = metadata.get_table("metrics", "cpu").await.unwrap().unwrap();
+        assert_eq!(detail.row_count, 6, "stats must not double-count");
     }
 
     #[tokio::test]

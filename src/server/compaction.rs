@@ -40,9 +40,13 @@ impl CompactionScheduler {
     }
 
     /// 遍历所有表目录，把小于 `min_file_size_mb` 的 Parquet 文件合并为单个文件。
-    /// 合并结果写入 `compacted_{ts}.parquet`（原文件删除，临时文件带
-    /// `.parquet.tmp` 后缀避免被 ListingTable 扫描到）。
+    /// 合并结果写入 `compacted_{hash}_{n}.parquet`（原文件删除，临时文件带
+    /// `.parquet.tmp` 后缀避免被 ListingTable 扫描到）。合并后的原文件名
+    /// 写入墓碑表，丢失响应的 ingest 重传据此跳过。
     pub async fn run_once(&self) -> Result<(), String> {
+        // Prune tombstones older than 7 days on each run.
+        let cutoff = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        let _ = self.metadata.prune_tombstones(cutoff).await;
         let min_size = (self.config.min_file_size_mb * 1024 * 1024) as u64;
         let target_size = (self.config.target_file_size_mb * 1024 * 1024) as u64;
 
@@ -111,10 +115,15 @@ impl CompactionScheduler {
                         .map_err(|e| format!("sort: {}", e))?;
                 }
 
-                let now_ms = chrono::Utc::now().timestamp_millis();
+                // Deterministic output name: FNV-1a over the sorted input
+                // filenames. If a crash happens between rename and deleting
+                // the originals, the next cycle sees the same input set and
+                // overwrites the same compacted file instead of stacking a
+                // duplicate (which recount would then double-count).
+                let input_hash = fnv1a_of_filenames(&small_files);
                 let tmp_path = table_entry
                     .path()
-                    .join(format!("compacted_{}_{}.parquet.tmp", now_ms, small_files.len()));
+                    .join(format!("compacted_{}_{}.parquet.tmp", input_hash, small_files.len()));
                 let write_options =
                     datafusion::dataframe::DataFrameWriteOptions::new().with_single_file_output(true);
                 df.write_parquet(&tmp_path.to_string_lossy(), write_options, None)
@@ -124,10 +133,21 @@ impl CompactionScheduler {
                 // I7 fix: rename first, then delete originals (crash-safe)
                 let final_path = table_entry
                     .path()
-                    .join(format!("compacted_{}.parquet", chrono::Utc::now().timestamp_millis()));
+                    .join(format!("compacted_{}_{}.parquet", input_hash, small_files.len()));
                 std::fs::rename(&tmp_path, &final_path).map_err(|e| format!("rename: {}", e))?;
                 for (_, old_path) in &small_files {
                     let _ = std::fs::remove_file(old_path);
+                }
+
+                // Tombstone the merged-away files: their rows now live only
+                // in the compacted output, so a lost-response ingest retry
+                // must not re-create them (it would duplicate the rows).
+                let names: Vec<String> = small_files
+                    .iter()
+                    .map(|(_, p)| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                    .collect();
+                if let Err(e) = self.metadata.tombstone_files(&names).await {
+                    tracing::warn!(db = %db_name, table = %table_name, "tombstone merged files: {}", e);
                 }
 
                 tracing::info!(
@@ -146,6 +166,22 @@ impl CompactionScheduler {
         }
         Ok(())
     }
+}
+
+/// FNV-1a hash over the sorted input filenames — a deterministic fingerprint
+/// of the merge's input set. Same inputs → same name (crash-replay
+/// overwrites); different inputs → different name.
+fn fnv1a_of_filenames(files: &[(u64, PathBuf)]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for (_, path) in files {
+        for b in path.file_name().unwrap_or_default().to_string_lossy().bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0x7c; // separator between names
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// Parse cron-like "0 */N * * *" to extract N hours. Falls back to 6.
@@ -251,6 +287,40 @@ mod tests_compaction {
         assert_eq!(detail.row_count, 9, "compaction must not double-count rows");
         assert_eq!(detail.time_min, Some(1000));
         assert_eq!(detail.time_max, Some(3000));
+    }
+
+    /// Crash-replay: if the process dies between rename and deleting the
+    /// originals, the next cycle sees the same input set — the deterministic
+    /// name must make it overwrite the existing compacted file instead of
+    /// stacking a duplicate (which recount would double-count).
+    #[tokio::test]
+    async fn test_run_once_crash_replay_does_not_duplicate() {
+        let dir = tempdir().unwrap();
+        seed_table(dir.path(), "metrics", "cpu", 3);
+
+        let s = scheduler(dir.path(), 1);
+        s.metadata
+            .update_stats("metrics", "cpu", 1000, 3000, 9, &[], &[])
+            .await
+            .unwrap();
+
+        s.run_once().await.unwrap();
+        let table_dir = dir.path().join("metrics").join("cpu");
+        let first: Vec<String> = files_in(&table_dir);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].starts_with("compacted_"));
+
+        // Simulate the crash window: the originals are still on disk.
+        seed_table(dir.path(), "metrics", "cpu", 3);
+        s.run_once().await.unwrap();
+
+        let second: Vec<String> = files_in(&table_dir);
+        assert_eq!(second.len(), 1, "replay must overwrite, not stack a duplicate");
+        assert_eq!(second[0], first[0], "same input set must produce the same compacted name");
+
+        // Stats must not double-count.
+        let detail = s.metadata.get_table("metrics", "cpu").await.unwrap().unwrap();
+        assert_eq!(detail.row_count, 9);
     }
 
     #[tokio::test]

@@ -61,6 +61,14 @@ impl Db {
                 table_id   INTEGER NOT NULL REFERENCES tables(id),
                 PRIMARY KEY (agent_id, table_id)
             );
+
+            -- Files absorbed by compaction: a lost-response retry of an
+            -- already-merged upload must not re-create the file (the rows
+            -- live in the compacted output). Entries pruned after 7 days.
+            CREATE TABLE IF NOT EXISTS compaction_tombstones (
+                file_name  TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            );
         ")?;
 
         // Migration: add listen_addr column if it doesn't exist (for DBs created before this feature)

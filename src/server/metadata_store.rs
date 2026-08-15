@@ -305,6 +305,48 @@ impl MetadataStore {
             .map_err(|e| format!("list table agents collect: {}", e))
     }
 
+    /// True when the file name was absorbed by a compaction merge — an
+    /// ingest retry (lost-response upload) must then skip re-creating it.
+    pub async fn is_tombstoned(&self, file_name: &str) -> Result<bool, String> {
+        let conn = self.db.conn().lock().await;
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM compaction_tombstones WHERE file_name = ?1",
+                params![file_name],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(found.is_some())
+    }
+
+    /// Record merged-away files after a successful compaction merge.
+    pub async fn tombstone_files(&self, names: &[String]) -> Result<(), String> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let conn = self.db.conn().lock().await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        for name in names {
+            conn.execute(
+                "INSERT OR IGNORE INTO compaction_tombstones (file_name, created_at) VALUES (?1, ?2)",
+                params![name, now_ms],
+            )
+            .map_err(|e| format!("tombstone {}: {}", name, e))?;
+        }
+        Ok(())
+    }
+
+    /// Prune tombstones older than 7 days (the staging retry window is
+    /// seconds-to-minutes; 7 days covers agent downtime comfortably).
+    pub async fn prune_tombstones(&self, older_than_ms: i64) -> Result<usize, String> {
+        let conn = self.db.conn().lock().await;
+        conn.execute(
+            "DELETE FROM compaction_tombstones WHERE created_at < ?1",
+            params![older_than_ms],
+        )
+        .map_err(|e| format!("prune tombstones: {}", e))
+    }
+
     /// Recompute a table's time range and total_rows by scanning every
     /// Parquet file currently in `{data_dir}/{db}/{table}`. REPLACE
     /// semantics — unlike update_stats this does not accumulate, so it is
