@@ -126,8 +126,25 @@ impl IngestApiHandler {
             return Ok(Response::builder().status(200).body("ok".into()).unwrap());
         }
 
-        if let Err(e) = std::fs::write(&filepath, &body) {
-            return Ok(json_err(500, &format!("write: {}", e)));
+        // Durable before responding: the agent treats 200 as "safe to
+        // discard all other copies" (chunk + WAL), so the file must be on
+        // stable storage — not just the page cache — before we say success.
+        {
+            use std::io::Write;
+            let mut f = match std::fs::File::create(&filepath) {
+                Ok(f) => f,
+                Err(e) => return Ok(json_err(500, &format!("write: {}", e))),
+            };
+            if let Err(e) = f.write_all(&body) {
+                return Ok(json_err(500, &format!("write: {}", e)));
+            }
+            if let Err(e) = f.sync_all() {
+                return Ok(json_err(500, &format!("sync: {}", e)));
+            }
+            // Directory fsync so the dirent survives a crash too.
+            if let Ok(d) = std::fs::File::open(&table_dir) {
+                let _ = d.sync_all();
+            }
         }
 
         // 读取 Parquet footer stats 并更新元数据。
