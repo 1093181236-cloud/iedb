@@ -220,23 +220,12 @@ async fn run_agent(
                 _ = wal_shutdown.notified() => break,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(wal_interval)) => {}
             }
-            // C1 fix: scope wal guard release before acquiring buffer lock
-            let ops = {
-                let mut wal_guard = wal_flush.lock().await;
-                match wal_guard.flush().await {
-                    Ok(ops) => ops,
-                    Err(e) => { tracing::error!(%e, "WAL flush failed"); continue; }
-                }
-            };
-            // wal guard dropped here — buffer lock acquired below
-            if !ops.is_empty() {
-                let wal_seq = wal_flush.lock().await.current_sequence().saturating_sub(1);
-                let mut buf = wal_buffer.lock().await;
-                for op in &ops {
-                    if let WalOp::Write(batch) = op {
-                        apply_write_batch(&mut buf, batch, wal_seq);
-                    }
-                }
+            // Flush + apply in one helper: the wal seq is captured in the
+            // same lock scope as the flush, so a concurrent write flush can
+            // never overstate it (TOCTOU fix — an overstated seq would let a
+            // handoff clean a WAL file whose chunk is still unsnapshotted).
+            if let Err(e) = iedb::agent::wal::wal_core::flush_and_apply(&wal_flush, &wal_buffer).await {
+                tracing::error!(%e, "WAL flush failed");
             }
         }
     });

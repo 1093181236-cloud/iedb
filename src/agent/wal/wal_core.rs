@@ -367,6 +367,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// The applied wal_seq must exactly match the WAL file that holds the
+    /// ops: two sequential flush_and_apply rounds produce chunks whose
+    /// min/max seqs equal files 1 and 2 on disk. An off-by-one (e.g. reading
+    /// the seq in a second lock scope) breaks this correspondence.
+    #[tokio::test]
+    async fn test_flush_and_apply_tracks_file_seq() {
+        use crate::agent::buffer::Buffer;
+        let tmp = test_data_dir();
+        let config = WalConfig {
+            flush_interval_secs: 1,
+            max_write_buffer_ops: 100,
+        };
+        let wal = tokio::sync::Mutex::new(WalManager::new(&tmp, &config).await.unwrap());
+        let buffer = tokio::sync::Mutex::new(Buffer::new());
+
+        for i in 0..2 {
+            {
+                let mut w = wal.lock().await;
+                w.buffer_op(WalOp::Write(WriteBatch {
+                    db_name: "db1".into(),
+                    table_name: "tbl1".into(),
+                    chunk_time: i as i64,
+                    field_names: vec!["v".into()],
+                    tag_keys: vec![],
+                    rows: vec![Row {
+                        time: 100 * (i + 1) as i64,
+                        tag_values: vec![],
+                        field_values: vec![Some(FieldValue::I64(i as i64 + 1))],
+                    }],
+                }))
+                .unwrap();
+            }
+            let n = flush_and_apply(&wal, &buffer).await.unwrap();
+            assert_eq!(n, 1);
+        }
+
+        // Two chunks, each carrying the seq of the file that holds its op.
+        let buf = buffer.lock().await;
+        let table = buf.get_table("db1", "tbl1").unwrap();
+        assert_eq!(table.chunks.len(), 2);
+        let seqs: Vec<(i64, u64)> = table
+            .chunks
+            .iter()
+            .map(|c| (c.chunk_time, c.min_wal_seq))
+            .collect();
+        assert_eq!(seqs, vec![(0, 1), (1, 2)],
+            "chunk wal seqs must match their WAL files exactly");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[tokio::test]
     async fn test_buffer_op_count_and_limit() {
         let tmp = test_data_dir();
@@ -685,6 +736,34 @@ mod tests {
 ///
 /// Ensures the target table and chunk exist, evolves the schema as needed,
 /// inserts each row, and builds the tag index.
+/// Flush pending WAL ops and apply them to the buffer — the sequence
+/// number is captured in the SAME lock scope as the flush, so a concurrent
+/// write flush between two acquisitions can never overstate it (an
+/// overstated seq lets a later handoff clean a WAL file whose chunk is
+/// still unsnapshotted). Shared by the periodic flush task.
+pub async fn flush_and_apply(
+    wal: &tokio::sync::Mutex<WalManager>,
+    buffer: &tokio::sync::Mutex<Buffer>,
+) -> Result<usize, WalError> {
+    let (ops, wal_seq) = {
+        let mut guard = wal.lock().await;
+        let ops = guard.flush().await?;
+        let wal_seq = guard.current_sequence().saturating_sub(1);
+        (ops, wal_seq)
+    };
+    // wal guard dropped here — buffer lock acquired below (lock ordering:
+    // never hold both; the write path follows the same order).
+    if !ops.is_empty() {
+        let mut buf = buffer.lock().await;
+        for op in &ops {
+            if let WalOp::Write(batch) = op {
+                apply_write_batch(&mut buf, batch, wal_seq);
+            }
+        }
+    }
+    Ok(ops.len())
+}
+
 pub fn apply_write_batch(buffer: &mut Buffer, batch: &WriteBatch, wal_seq: u64) {
     let table = buffer.get_or_create_table(&batch.db_name, &batch.table_name);
 
