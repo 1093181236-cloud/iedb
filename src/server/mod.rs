@@ -56,6 +56,7 @@ pub async fn run_server(config: Arc<Config>, include_agent_api: bool) -> Result<
     let engine = Arc::new(QueryEngine::new(
         query_cfg.max_rows,
         query_cfg.query_timeout_secs,
+        query_cfg.max_concurrent_queries,
     ));
     TableProvider::register_all(&engine, &query_cfg.data_dir).await?;
 

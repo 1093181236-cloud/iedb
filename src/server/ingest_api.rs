@@ -387,7 +387,7 @@ mod tests {
         let data_dir = dir.path().join("data");
         let db_path = dir.path().join("test.db");
         let db = Db::open(&db_path).unwrap();
-        let engine = Arc::new(QueryEngine::new(100, 10));
+        let engine = Arc::new(QueryEngine::new(100, 10, 4));
         let handler = IngestApiHandler {
             data_dir: data_dir.clone(),
             metadata: Arc::new(MetadataStore::new(Arc::new(db))),

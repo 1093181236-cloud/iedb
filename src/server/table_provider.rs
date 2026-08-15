@@ -116,7 +116,7 @@ mod tests {
         write_test_parquet(&table_dir.join("a.parquet"));
         write_test_parquet(&table_dir.join("b.parquet"));
 
-        let engine = QueryEngine::new(100, 10);
+        let engine = QueryEngine::new(100, 10, 4);
         TableProvider::register_all(&engine, dir.path()).await.unwrap();
         assert!(engine.ctx().table_exist("metrics.cpu").unwrap());
 
@@ -128,7 +128,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_all_missing_dir_is_ok() {
         let dir = tempdir().unwrap();
-        let engine = QueryEngine::new(100, 10);
+        let engine = QueryEngine::new(100, 10, 4);
         TableProvider::register_all(&engine, &dir.path().join("nope")).await.unwrap();
     }
 
@@ -139,7 +139,7 @@ mod tests {
         std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
         write_test_parquet(&file_path);
 
-        let engine = QueryEngine::new(100, 10);
+        let engine = QueryEngine::new(100, 10, 4);
         TableProvider::add_file(&engine, "metrics", "cpu", &file_path).await.unwrap();
         assert!(engine.ctx().table_exist("metrics.cpu").unwrap());
 

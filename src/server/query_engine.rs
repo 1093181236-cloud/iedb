@@ -1,20 +1,34 @@
 // DataFusion-backed SQL query engine with result-size limits and timeouts.
 use datafusion::prelude::*;
 use serde_json::{Map, Value};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Error prefix returned when all query slots are busy — sql_api maps it
+/// to HTTP 503 (service overloaded).
+pub const OVERLOADED: &str = "server overloaded: max concurrent queries reached";
 
 pub struct QueryEngine {
     ctx: SessionContext,
     max_rows: usize,
     query_timeout_secs: u64,
+    /// Concurrency gate: one permit per in-flight query, acquired for the
+    /// whole query (including federation fetches). At capacity, queries
+    /// are rejected immediately rather than queued.
+    query_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl QueryEngine {
-    pub fn new(max_rows: usize, query_timeout_secs: u64) -> Self {
+    pub fn new(max_rows: usize, query_timeout_secs: u64, max_concurrent_queries: usize) -> Self {
         let mut config = SessionConfig::new();
         config.options_mut().sql_parser.dialect = "Generic".to_string();
         let ctx = SessionContext::new_with_config(config);
-        QueryEngine { ctx, max_rows, query_timeout_secs }
+        QueryEngine {
+            ctx,
+            max_rows,
+            query_timeout_secs,
+            query_slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent_queries)),
+        }
     }
 
     pub fn ctx(&self) -> &SessionContext {
@@ -30,6 +44,13 @@ impl QueryEngine {
         mode: crate::server::federation::QueryMode,
         federator: Option<&crate::server::federation::Federator>,
     ) -> Result<Value, String> {
+        // Concurrency gate: hold a slot for the whole query. Reject
+        // immediately at capacity (no queueing — callers retry).
+        let _permit = match self.query_slots.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return Err(OVERLOADED.to_string()),
+        };
+
         let mut outcome: Option<crate::server::federation::FederationOutcome> = None;
         // The timeout covers the WHOLE body: federation prepare (buffer
         // fetches, up to 2s per agent) runs before planning, so it must be
@@ -209,7 +230,7 @@ mod tests {
         let table_dir = dir.path().join("metrics").join("cpu");
         std::fs::create_dir_all(&table_dir).unwrap();
         write_test_parquet(&table_dir.join("a.parquet"));
-        let engine = QueryEngine::new(max_rows, 10);
+        let engine = QueryEngine::new(max_rows, 10, 4);
         (dir, engine)
     }
 
@@ -255,14 +276,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_sql_error() {
-        let engine = QueryEngine::new(100, 10);
+        let engine = QueryEngine::new(100, 10, 4);
         let err = engine.query("SELEC broken", QueryMode::History, None).await.unwrap_err();
         assert!(err.contains("SQL error"));
     }
 
     #[tokio::test]
     async fn test_query_table_not_exists_returns_error() {
-        let engine = QueryEngine::new(100, 10);
+        let engine = QueryEngine::new(100, 10, 4);
         let err = engine.query("SELECT * FROM nonexistent.table", QueryMode::History, None).await.unwrap_err();
         assert!(err.contains("SQL error"), "unexpected error: {}", err);
     }
@@ -270,11 +291,35 @@ mod tests {
     #[tokio::test]
     async fn test_query_times_out() {
         let (dir, _) = engine_with_data(100);
-        let engine = QueryEngine::new(100, 0); // 0 秒超时 → 立即失败
+        let engine = QueryEngine::new(100, 0, 4); // 0 秒超时 → 立即失败
         TableProvider::register_all(&engine, dir.path()).await.unwrap();
 
         let err = engine.query("SELECT * FROM metrics.cpu", QueryMode::History, None).await.unwrap_err();
         assert!(err.contains("timed out"), "unexpected error: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_query_rejected_when_no_permits() {
+        let engine = QueryEngine::new(100, 10, 0); // 0 并发许可 → 立即过载
+        let err = engine.query("SELECT 1", QueryMode::History, None).await.unwrap_err();
+        assert!(
+            err.starts_with(crate::server::query_engine::OVERLOADED),
+            "expected overload error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_permit_released_after_completion() {
+        let (dir, engine) = engine_with_data(100);
+        TableProvider::register_all(&engine, dir.path()).await.unwrap();
+
+        // First query takes and releases the only permit…
+        let r1 = engine.query("SELECT * FROM metrics.cpu", QueryMode::History, None).await.unwrap();
+        assert_eq!(r1["returned_rows"], 3);
+        // …so the next query is not rejected.
+        let r2 = engine.query("SELECT * FROM metrics.cpu", QueryMode::History, None).await.unwrap();
+        assert_eq!(r2["returned_rows"], 3);
     }
 
     #[tokio::test]

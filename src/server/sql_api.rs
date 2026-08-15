@@ -61,6 +61,9 @@ impl SqlApiHandler {
                     Err(e2) => Ok(json_err(422, &e2)),
                 }
             }
+            Err(e) if e.starts_with(crate::server::query_engine::OVERLOADED) => {
+                Ok(json_err(503, &e))
+            }
             Err(e) => Ok(json_err(422, &e)),
         }
     }
@@ -82,7 +85,9 @@ fn status_code_to_str(s: u16) -> &'static str {
     match s {
         400 => "BAD_REQUEST",
         405 => "METHOD_NOT_ALLOWED",
+        413 => "PAYLOAD_TOO_LARGE",
         422 => "UNPROCESSABLE",
+        503 => "OVERLOADED",
         _ => "INTERNAL",
     }
 }
@@ -103,7 +108,7 @@ mod tests {
         write_test_parquet(&table_dir.join("a.parquet"));
 
         let data_dir = dir.path().to_path_buf();
-        let engine = Arc::new(QueryEngine::new(max_rows, 10));
+        let engine = Arc::new(QueryEngine::new(max_rows, 10, 4));
         TableProvider::register_all(&engine, &data_dir).await.unwrap();
         (dir, SqlApiHandler { engine, data_dir, federator: None })
     }
@@ -155,6 +160,25 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 422);
         assert!(resp.body().contains("SQL error"));
+    }
+
+    #[tokio::test]
+    async fn test_overloaded_returns_503() {
+        let dir = tempdir().unwrap();
+        let engine = Arc::new(QueryEngine::new(100, 10, 0)); // 0 并发许可
+        let h = SqlApiHandler {
+            engine,
+            data_dir: dir.path().to_path_buf(),
+            federator: None,
+        };
+
+        let resp = h
+            .handle(json_req("POST", r#"{"sql":"SELECT 1"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 503);
+        assert!(resp.body().contains("OVERLOADED"));
+        assert!(resp.body().contains("max concurrent queries"));
     }
 
     #[tokio::test]

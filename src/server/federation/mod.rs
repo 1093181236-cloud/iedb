@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn test_engine_time_range() {
-        let engine = QueryEngine::new(100, 30);
+        let engine = QueryEngine::new(100, 30, 4);
         // Normal range passes through in ns.
         assert_eq!(
             engine_time_range(&engine, "SELECT * FROM metrics.cpu WHERE time >= 100 AND time <= 200"),
@@ -709,7 +709,7 @@ mod tests {
             .unwrap();
 
         // --- Engine with an original (persisted-style) provider ---
-        let engine = QueryEngine::new(100, 30);
+        let engine = QueryEngine::new(100, 30, 4);
         let catalog_name = engine
             .ctx()
             .copied_config()
@@ -873,7 +873,7 @@ mod tests_federation {
         std::fs::create_dir_all(&table_dir).unwrap();
         write_test_parquet(&table_dir.join("a.parquet"));
 
-        let engine = QueryEngine::new(100, 10);
+        let engine = QueryEngine::new(100, 10, 4);
         Reg::register_all(&engine, dir.path()).await.unwrap();
 
         // Metadata: agent a1 -> metrics.cpu
@@ -964,7 +964,7 @@ mod tests_federation {
         let dir = tempdir().unwrap();
         // No write_test_parquet, no TableProvider::register_all: the
         // metrics schema does not exist in the catalog at all.
-        let engine = QueryEngine::new(100, 10);
+        let engine = QueryEngine::new(100, 10, 4);
 
         // Metadata: agent a1 -> metrics.fresh (agent row seeded first, as in
         // setup(), because agent_tables has a FK on agents)
