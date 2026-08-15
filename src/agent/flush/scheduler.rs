@@ -149,7 +149,7 @@ impl SnapshotScheduler {
     pub async fn last_snapshot_status(&self) -> SnapshotStatus {
         let mut status = self.last_snapshot.lock().await.clone();
         let elapsed = self.started_at.elapsed().as_secs() as i64;
-        let interval = self.config.snapshot_interval_secs();
+        let interval = self.current_snapshot_interval().max(1);
         // Approximate seconds until next scheduled snapshot
         let since_last = status.last_at
             .map(|ts| (chrono::Utc::now().timestamp_millis() - ts) / 1000)
@@ -793,6 +793,11 @@ mod tests {
         // A further update is picked up immediately (no restart)
         hot.apply_update(&serde_json::json!({"flush": {"snapshot_interval": "2m"}}));
         assert_eq!(scheduler.current_snapshot_interval(), 120);
+
+        // The status endpoint must reflect the hot interval too
+        let status = scheduler.last_snapshot_status().await;
+        assert!(status.next_in_secs <= 120 && status.next_in_secs >= 0,
+            "next_snapshot_in_secs must follow the hot interval, got {}", status.next_in_secs);
     }
 
     /// A staging retry must upload the file and delete it on success.

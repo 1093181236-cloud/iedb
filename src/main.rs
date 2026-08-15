@@ -284,6 +284,7 @@ async fn run_agent(
         agent_client: agent_client.clone(),
         config: config.clone(),
         started_at: std::time::Instant::now(),
+        hot: Some(hot_config.clone()),
     });
 
     let addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.server.port).parse()?;

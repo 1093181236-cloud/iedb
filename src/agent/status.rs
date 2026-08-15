@@ -18,6 +18,9 @@ pub struct StatusHandler {
     pub agent_client: Option<Arc<AgentClient>>,
     pub config: Arc<Config>,
     pub started_at: Instant,
+    /// Optional runtime-hot config; when present its memory_limit is
+    /// reported instead of the static config value.
+    pub hot: Option<Arc<crate::agent::hot_config::HotConfig>>,
 }
 
 impl StatusHandler {
@@ -134,7 +137,10 @@ impl StatusHandler {
                 "database_count": db_count,
                 "total_rows": total_rows,
                 "total_memory_bytes": total_mem,
-                "memory_limit_bytes": self.config.memory_limit_bytes(),
+                "memory_limit_bytes": self
+                    .hot
+                    .as_ref()
+                    .map_or_else(|| self.config.memory_limit_bytes(), |h| h.memory_limit_bytes()),
                 "databases": buf_json,
             },
             "wal": wal_info,
