@@ -167,7 +167,10 @@ impl SnapshotScheduler {
         let end_time_marker = ((now_ns - snapshot_interval_ns) / snapshot_interval_ns)
             * snapshot_interval_ns;
 
-        // C5 fix: collect chunk_time values instead of positional indices
+        // C5 fix: collect chunk_time values instead of positional indices.
+        // The captured row count per chunk is recorded at clone time: the
+        // handoff drains exactly those rows so writes landing in the window
+        // while the upload is in flight survive for the next cycle.
         let mut chunks_to_flush: Vec<(String, String, Vec<i64>)> = Vec::new();
 
         {
@@ -199,6 +202,12 @@ impl SnapshotScheduler {
                     .collect()
             };
 
+            // (chunk_time, captured row count) for the handoff drain.
+            let captured: Vec<(i64, usize)> = chunks
+                .iter()
+                .map(|c| (c.chunk_time, c.rows.len()))
+                .collect();
+
             let chunk_refs: Vec<&crate::agent::buffer::chunk::Chunk> = chunks.iter().collect();
 
             let table_for_schema = {
@@ -212,13 +221,18 @@ impl SnapshotScheduler {
                     .map_err(|e| format!("parquet write: {}", e))?;
 
             // Upload — shared helper so the staging retry loop re-uploads
-            // with identical semantics (backend, chunk_time, agent id).
+            // with identical semantics (backend, chunk_time, wal seq, agent id).
+            // The wal seq is the max over the serialized chunks: a later flush
+            // of the same window carries a higher seq, so filenames never
+            // collide and the name-only idempotence stays precise.
+            let serialized_max_wal = chunks.iter().map(|c| c.max_wal_seq).max().unwrap_or(0);
             let upload_result = self
                 .upload_bytes(
                     db_name,
                     table_name,
                     chunks.first().map(|c| c.chunk_time).unwrap_or(0),
                     chunks.first().map(|c| c.time_min).unwrap_or(0),
+                    serialized_max_wal,
                     &parquet_data,
                     Some(&table),
                 )
@@ -234,7 +248,7 @@ impl SnapshotScheduler {
                         status.last_size_bytes = parquet_data.len() as u64;
                     }
                     // Data is safe on the server — hand the chunks off.
-                    self.complete_chunk_handoff(db_name, table_name, &chunk_times)
+                    self.complete_chunk_handoff(db_name, table_name, &captured)
                         .await?;
                     flushed_count += 1;
                 }
@@ -260,10 +274,11 @@ impl SnapshotScheduler {
                         db_name,
                         table_name,
                         chunks.first().map(|c| c.chunk_time).unwrap_or(0),
+                        serialized_max_wal,
                         &parquet_data,
                     )
                     .map_err(|e| format!("staging save: {}", e))?;
-                    self.complete_chunk_handoff(db_name, table_name, &chunk_times)
+                    self.complete_chunk_handoff(db_name, table_name, &captured)
                         .await?;
                 }
             }
@@ -281,15 +296,30 @@ impl SnapshotScheduler {
         &self,
         db_name: &str,
         table_name: &str,
-        chunk_times: &[i64],
+        captured: &[(i64, usize)],
     ) -> Result<(), String> {
-        // C5 fix: remove chunks by chunk_time, not positional index
-        // I2 fix: track snapshot sequence for WAL cleanup
+        // C5 fix: address chunks by chunk_time, not positional index.
+        // Critical-1 fix: drain exactly the row count captured at
+        // serialization — rows that arrived in the same window while the
+        // upload was in flight stay in the chunk for the next cycle.
         let snapshot_wal_seq = {
             let mut buf = self.buffer.lock().await;
-            // Remove chunks by chunk_time value
             if let Some(table) = buf.get_table_mut(db_name, table_name) {
-                table.chunks.retain(|c| !chunk_times.contains(&c.chunk_time));
+                let tag_keys = table.schema.tag_keys.clone();
+                for (chunk_time, captured_len) in captured {
+                    if let Some(chunk) = table
+                        .chunks
+                        .iter_mut()
+                        .find(|c| c.chunk_time == *chunk_time)
+                    {
+                        chunk.rows.drain(0..(*captured_len).min(chunk.rows.len()));
+                        // Row positions shifted (or the chunk emptied) —
+                        // rebuild so tag filters stay correct.
+                        chunk.rebuild_tag_index(&tag_keys);
+                    }
+                }
+                // Drop chunks fully drained; keep chunks with retained rows.
+                table.chunks.retain(|c| !c.rows.is_empty());
             }
 
             // Compute safe wal seq
@@ -343,13 +373,16 @@ impl SnapshotScheduler {
 
     /// Upload parquet bytes through the configured backend (http / s3 /
     /// local). Shared by the snapshot path and the staging retry loop.
-    /// `table` is needed only by the local backend's on_local_flush callback.
+    /// `wal_seq` (max WAL seq of the serialized rows) goes into the target
+    /// name so later flushes of the same window never collide with earlier
+    /// ones. `table` is needed only by the local backend's callback.
     async fn upload_bytes(
         &self,
         db_name: &str,
         table_name: &str,
         chunk_time: i64,
         time_min: i64,
+        wal_seq: u64,
         parquet_data: &[u8],
         table: Option<&crate::agent::buffer::chunk::Table>,
     ) -> Result<(), String> {
@@ -368,14 +401,21 @@ impl SnapshotScheduler {
 
         match self.config.flush.backend.as_str() {
             "local" => {
-                // local backend: write parquet directly to disk, no upload
+                // local backend: write parquet directly to disk, no upload.
+                // The wal seq in the name prevents a later flush of the same
+                // window from overwriting the earlier batch.
+                let local_name = if wal_seq > 0 {
+                    format!("local_{}_{}.parquet", chunk_time, wal_seq)
+                } else {
+                    format!("local_{}.parquet", chunk_time)
+                };
                 let file_path = self
                     .config
                     .data
                     .dir
                     .join(db_name)
                     .join(table_name)
-                    .join(format!("local_{}.parquet", chunk_time));
+                    .join(local_name);
                 if let Some(parent) = file_path.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("local mkdir: {}", e))?;
@@ -405,6 +445,7 @@ impl SnapshotScheduler {
                     None,
                     agent_id,
                     Some(chunk_time),
+                    wal_seq,
                 )
                 .await
                 {
@@ -457,11 +498,20 @@ impl SnapshotScheduler {
                         tracing::info!(path = %file_entry.path().display(), "Reaped stale staging tmp");
                         continue;
                     }
-                    let chunk_time = match name
+                    // Staging name: {chunk_time}.parquet (legacy) or
+                    // {chunk_time}_{wal}.parquet — the wal part rebuilds the
+                    // original upload name so retries stay idempotent.
+                    let (chunk_time, wal_seq) = match name
                         .strip_suffix(".parquet")
-                        .and_then(|s| s.parse::<i64>().ok())
+                        .and_then(|s| {
+                            let (ct, wal) = match s.split_once('_') {
+                                Some((a, b)) => (a.parse::<i64>().ok()?, Some(b.parse::<u64>().ok()?)),
+                                None => (s.parse::<i64>().ok()?, None),
+                            };
+                            Some((ct, wal.unwrap_or(0)))
+                        })
                     {
-                        Some(ct) => ct,
+                        Some(x) => x,
                         None => continue, // not a staging file we recognize
                     };
                     let data = match std::fs::read(file_entry.path()) {
@@ -472,7 +522,7 @@ impl SnapshotScheduler {
                         }
                     };
                     match self
-                        .upload_bytes(&db_name, &table_name, chunk_time, chunk_time, &data, None)
+                        .upload_bytes(&db_name, &table_name, chunk_time, chunk_time, wal_seq, &data, None)
                         .await
                     {
                         Ok(()) => {
@@ -607,6 +657,75 @@ mod tests {
         assert!(selected.is_empty());
     }
 
+    /// Critical-1 regression: the handoff must drain exactly the rows that
+    /// were captured at serialization — a row landing in the same window
+    /// while the upload was in flight must stay in the chunk (and its tag
+    /// index must still resolve it after the shift).
+    #[tokio::test]
+    async fn test_handoff_drains_only_captured_rows() {
+        use crate::agent::buffer::Buffer;
+        use crate::agent::buffer::chunk::{Chunk, FieldType, FieldValue, Row};
+        use crate::agent::wal::wal_core::WalManager;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let wal_cfg = crate::config::WalConfig {
+            flush_interval_secs: 1,
+            max_write_buffer_ops: 100_000,
+        };
+        let wal = Arc::new(Mutex::new(WalManager::new(&data_dir, &wal_cfg).await.unwrap()));
+        let buffer = Arc::new(Mutex::new(Buffer::new()));
+        {
+            let mut buf = buffer.lock().await;
+            let table = buf.get_or_create_table("db1", "tbl1");
+            table.schema.ensure_tag_key("host");
+            table.schema.ensure_field("v", FieldType::F64);
+            let mut chunk = Chunk::new(0);
+            for i in 0..3 {
+                chunk.rows.push(Row {
+                    time: (i + 1) as i64 * 100,
+                    tag_values: vec![format!("srv{}", i)],
+                    field_values: vec![Some(FieldValue::F64(i as f64))],
+                });
+                table.build_tag_index(&mut chunk, i, &[format!("srv{}", i)]);
+            }
+            table.chunks.push(chunk);
+        }
+
+        let toml = format!(
+            r#"
+            [server]
+            port = 8080
+            [data]
+            dir = "{}"
+            [flush]
+            snapshot_interval = "10m"
+            backend = "http"
+            memory_limit = "512MB"
+            "#,
+            data_dir.display()
+        );
+        let config: crate::config::Config = toml::from_str(&toml).unwrap();
+        let scheduler = SnapshotScheduler::new(buffer.clone(), wal, Arc::new(config), reqwest::Client::new());
+
+        // Serialization captured 2 of the 3 rows; the third "arrived" later.
+        scheduler
+            .complete_chunk_handoff("db1", "tbl1", &[(0, 2)])
+            .await
+            .unwrap();
+
+        let buf = buffer.lock().await;
+        let table = buf.get_table("db1", "tbl1").unwrap();
+        assert_eq!(table.chunks.len(), 1, "chunk with retained rows must stay");
+        assert_eq!(table.chunks[0].rows.len(), 1, "only the late row survives");
+        assert_eq!(table.chunks[0].rows[0].time, 300);
+
+        // The tag index must still resolve the retained row (positions shifted)
+        let idx = table.chunks[0].tag_index.get("host").and_then(|m| m.get("srv2")).unwrap();
+        assert_eq!(idx, &vec![0usize], "tag index must be rebuilt after the drain");
+    }
+
     /// Upload failure must hand the chunk off to staging: the staging file
     /// is created (deterministic name), the chunk leaves the buffer, and the
     /// WAL is cleaned — freeing memory and leaving staging as the only copy.
@@ -723,7 +842,8 @@ mod tests {
         scheduler.do_snapshot().await.unwrap();
 
         // asserts: staging file with deterministic chunk_time name
-        let staging_file = scheduler.staging_dir.join("db1").join("tbl1").join("0.parquet");
+        // Rows carry wal seqs 1..=3 → serialized_max_wal = 3 → name 0_3.parquet
+        let staging_file = scheduler.staging_dir.join("db1").join("tbl1").join("0_3.parquet");
         assert!(staging_file.exists(), "staging file must exist after failed upload");
 
         // chunk removed from buffer

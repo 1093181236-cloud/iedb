@@ -5,11 +5,15 @@ use tracing;
 
 /// Build the ingest endpoint URL. `chunk_time` (ns) makes the server-side
 /// filename deterministic across retries; None keeps backward compat.
+/// `wal_seq` (the max WAL seq of the serialized rows) disambiguates later
+/// flushes of the same window — retries reuse it, new batches get a higher
+/// one, so files never collide. 0 omits the param (legacy staging files).
 pub fn build_ingest_url(
     server_url: &str,
     db: &str,
     table: &str,
     chunk_time: Option<i64>,
+    wal_seq: u64,
 ) -> String {
     let mut url = format!(
         "{}/api/v1/ingest/parquet?db={}&measurement={}",
@@ -19,6 +23,9 @@ pub fn build_ingest_url(
     );
     if let Some(ct) = chunk_time {
         url.push_str(&format!("&chunk_time={}", ct));
+    }
+    if wal_seq > 0 {
+        url.push_str(&format!("&wal={}", wal_seq));
     }
     url
 }
@@ -33,8 +40,9 @@ pub async fn upload_parquet(
     auth_header: Option<&str>,
     agent_id: &str,
     chunk_time: Option<i64>,
+    wal_seq: u64,
 ) -> Result<(), UploadError> {
-    let url = build_ingest_url(server_url, db, table, chunk_time);
+    let url = build_ingest_url(server_url, db, table, chunk_time, wal_seq);
 
     let mut req = client
         .post(&url)
@@ -68,6 +76,7 @@ pub fn staging_save(
     db: &str,
     table: &str,
     chunk_time: i64,
+    wal_seq: u64,
     data: &[u8],
 ) -> Result<PathBuf, std::io::Error> {
     let dir = staging_dir.join(db).join(table);
@@ -77,8 +86,15 @@ pub fn staging_save(
     // then rename onto the final name. A crash mid-write leaves only the
     // .tmp (reaped by the retry loop), never a truncated file under the
     // final name — a partial file there would be uploaded as authoritative.
-    let path = dir.join(format!("{}.parquet", chunk_time));
-    let tmp_path = dir.join(format!("{}.parquet.tmp", chunk_time));
+    // The name carries the wal seq so a retry rebuilds the same upload name
+    // (idempotence) and a later flush of the same window gets a fresh name.
+    let name = if wal_seq > 0 {
+        format!("{}_{}.parquet", chunk_time, wal_seq)
+    } else {
+        format!("{}.parquet", chunk_time)
+    };
+    let path = dir.join(&name);
+    let tmp_path = dir.join(format!("{}.tmp", name));
     let mut f = fs::File::create(&tmp_path)?;
     std::io::Write::write_all(&mut f, data)?;
     f.sync_all()?;
@@ -130,7 +146,7 @@ mod tests {
         let tmp = test_staging_dir();
         let data = b"mock parquet binary data";
 
-        let result = staging_save(&tmp, "metrics_db", "cpu_usage", 1700000000000000000, data);
+        let result = staging_save(&tmp, "metrics_db", "cpu_usage", 1700000000000000000, 1, data);
         assert!(result.is_ok());
 
         let path = result.unwrap();
@@ -157,8 +173,8 @@ mod tests {
         let data1 = b"first file";
         let data2 = b"second file data";
 
-        let path1 = staging_save(&tmp, "mydb", "table_a", 1700000000000000000, data1).unwrap();
-        let path2 = staging_save(&tmp, "mydb", "table_b", 1700000060000000000, data2).unwrap();
+        let path1 = staging_save(&tmp, "mydb", "table_a", 1700000000000000000, 1, data1).unwrap();
+        let path2 = staging_save(&tmp, "mydb", "table_b", 1700000060000000000, 1, data2).unwrap();
 
         assert!(path1.exists());
         assert!(path2.exists());
@@ -176,8 +192,8 @@ mod tests {
     fn test_staging_save_same_chunk_time_overwrites_same_file() {
         let tmp = test_staging_dir();
 
-        let path1 = staging_save(&tmp, "db", "tbl", 1700000000000000000, b"first attempt").unwrap();
-        let path2 = staging_save(&tmp, "db", "tbl", 1700000000000000000, b"second attempt").unwrap();
+        let path1 = staging_save(&tmp, "db", "tbl", 1700000000000000000, 1, b"first attempt").unwrap();
+        let path2 = staging_save(&tmp, "db", "tbl", 1700000000000000000, 1, b"second attempt").unwrap();
 
         // Same chunk_time → same deterministic filename, later write overwrites
         assert_eq!(path1, path2);
@@ -198,11 +214,11 @@ mod tests {
         use std::io::Read;
         let tmp = test_staging_dir();
 
-        let path = staging_save(&tmp, "db", "tbl", 1700000000000000000, b"AAAA").unwrap();
+        let path = staging_save(&tmp, "db", "tbl", 1700000000000000000, 1, b"AAAA").unwrap();
         let old_handle = std::fs::File::open(&path).unwrap();
 
         // Second save of the same chunk_time replaces the file.
-        staging_save(&tmp, "db", "tbl", 1700000000000000000, b"BBBBBBBB").unwrap();
+        staging_save(&tmp, "db", "tbl", 1700000000000000000, 1, b"BBBBBBBB").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"BBBBBBBB");
 
         // The fd opened BEFORE the replace must still read the old bytes:
@@ -218,29 +234,43 @@ mod tests {
     fn test_staging_save_different_chunk_time_different_files() {
         let tmp = test_staging_dir();
 
-        let path1 = staging_save(&tmp, "db", "tbl", 1700000000000000000, b"one").unwrap();
-        let path2 = staging_save(&tmp, "db", "tbl", 1700000060000000000, b"two").unwrap();
+        let path1 = staging_save(&tmp, "db", "tbl", 1700000000000000000, 1, b"one").unwrap();
+        let path2 = staging_save(&tmp, "db", "tbl", 1700000060000000000, 1, b"two").unwrap();
 
         assert_ne!(path1, path2);
-        assert_eq!(path1.file_name().unwrap(), "1700000000000000000.parquet");
-        assert_eq!(path2.file_name().unwrap(), "1700000060000000000.parquet");
+        assert_eq!(path1.file_name().unwrap(), "1700000000000000000_1.parquet");
+        assert_eq!(path2.file_name().unwrap(), "1700000060000000000_1.parquet");
 
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn test_ingest_url_includes_chunk_time() {
-        let url = build_ingest_url("http://server:8080", "mydb", "cpu", Some(1700000000000000000));
+    fn test_ingest_url_includes_chunk_time_and_wal() {
+        let url = build_ingest_url("http://server:8080", "mydb", "cpu", Some(1700000000000000000), 42);
         assert!(url.contains("/api/v1/ingest/parquet?"));
         assert!(url.contains("db=mydb"));
         assert!(url.contains("measurement=cpu"));
         assert!(url.contains("chunk_time=1700000000000000000"));
+        assert!(url.contains("wal=42"));
     }
 
     #[test]
     fn test_ingest_url_without_chunk_time_for_backward_compat() {
-        let url = build_ingest_url("http://server:8080/", "mydb", "cpu", None);
+        let url = build_ingest_url("http://server:8080/", "mydb", "cpu", None, 0);
         assert!(!url.contains("chunk_time"));
+        assert!(!url.contains("wal="));
         assert!(url.starts_with("http://server:8080/api/v1/ingest/parquet?"));
+    }
+
+    #[test]
+    fn test_staging_name_includes_wal_seq() {
+        let tmp = test_staging_dir();
+        let path = staging_save(&tmp, "db", "tbl", 1700000000000000000, 7, b"data").unwrap();
+        assert_eq!(
+            path.file_name().unwrap(),
+            "1700000000000000000_7.parquet",
+            "staging name must carry the wal seq so retries reuse the same upload name"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

@@ -56,6 +56,14 @@ impl IngestApiHandler {
             .iter()
             .find(|(k, _)| k == "chunk_time")
             .and_then(|(_, v)| v.parse::<i64>().ok());
+        // Optional wal seq: a later flush of the same chunk window carries a
+        // higher seq, so the filename stays unique per batch — the name-only
+        // idempotence then never skips genuinely new rows.
+        let wal_seq = query
+            .iter()
+            .find(|(k, _)| k == "wal")
+            .and_then(|(_, v)| v.parse::<u64>().ok())
+            .unwrap_or(0);
 
         // 防止路径穿越：db/table 只允许单段名称
         if !is_safe_segment(&db) || !is_safe_segment(&table) {
@@ -95,7 +103,11 @@ impl IngestApiHandler {
         let chunk_time = chunk_time
             .or_else(|| chrono::Utc::now().timestamp_nanos_opt())
             .unwrap_or(0);
-        let filename = format!("{}_{}.parquet", agent_id, chunk_time);
+        let filename = if wal_seq > 0 {
+            format!("{}_{}_{}.parquet", agent_id, chunk_time, wal_seq)
+        } else {
+            format!("{}_{}.parquet", agent_id, chunk_time)
+        };
         let filepath = table_dir.join(&filename);
 
         // Idempotence: a retry of the same chunk (staging re-upload after a
@@ -292,6 +304,50 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0], "agent-1_1700000000000000000.parquet",
             "filename must use the agent-provided chunk_time");
+    }
+
+    #[tokio::test]
+    async fn test_upload_uses_wal_seq_in_filename() {
+        let (_dir, h) = test_handler();
+
+        let resp = h
+            .handle(upload_req(
+                "/api/v1/ingest/parquet?db=metrics&measurement=cpu&chunk_time=1700000000000000000&wal=5",
+                make_test_parquet(),
+                "agent-1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let files: Vec<_> = std::fs::read_dir(h.data_dir.join("metrics").join("cpu"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, vec!["agent-1_1700000000000000000_5.parquet".to_string()]);
+    }
+
+    /// Critical-1 scenario 2: a later flush of the same chunk window carries
+    /// a higher wal seq → a different filename → both batches are stored,
+    /// never skipped by the name-only idempotence.
+    #[tokio::test]
+    async fn test_same_window_higher_wal_is_not_skipped() {
+        let (_dir, h) = test_handler();
+
+        let uri1 = "/api/v1/ingest/parquet?db=metrics&measurement=cpu&chunk_time=1700000000000000000&wal=1";
+        let uri2 = "/api/v1/ingest/parquet?db=metrics&measurement=cpu&chunk_time=1700000000000000000&wal=2";
+        assert_eq!(h.handle(upload_req(uri1, make_test_parquet(), "agent-1")).await.unwrap().status().as_u16(), 200);
+        assert_eq!(h.handle(upload_req(uri2, make_test_parquet(), "agent-1")).await.unwrap().status().as_u16(), 200);
+
+        let files: Vec<_> = std::fs::read_dir(h.data_dir.join("metrics").join("cpu"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 2, "same window + higher wal must produce a second file");
+
+        // Both batches counted in the stats.
+        let detail = h.metadata.get_table("metrics", "cpu").await.unwrap().unwrap();
+        assert_eq!(detail.row_count, 6, "both batches must be counted");
     }
 
     #[tokio::test]

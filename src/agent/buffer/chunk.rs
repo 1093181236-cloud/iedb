@@ -152,6 +152,24 @@ impl Chunk {
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
+    /// Rebuild the tag index from scratch. Needed after rows are drained
+    /// from the front (snapshot handoff keeps later-arriving rows): the
+    /// index stores row positions, which shift by the drained count.
+    pub fn rebuild_tag_index(&mut self, tag_keys: &[String]) {
+        self.tag_index.clear();
+        for (idx, row) in self.rows.iter().enumerate() {
+            for (key_idx, key) in tag_keys.iter().enumerate() {
+                if let Some(value) = row.tag_values.get(key_idx) {
+                    self.tag_index
+                        .entry(key.clone())
+                        .or_default()
+                        .entry(value.clone())
+                        .or_default()
+                        .push(idx);
+                }
+            }
+        }
+    }
 }
 
 /// A table holds a schema and time-ordered chunks (usually 1-2).
