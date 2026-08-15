@@ -258,6 +258,7 @@ async fn run_agent(
         buffer: buffer.clone(),
         wal: wal_manager.clone(),
         config: config.clone(),
+        hot: Some(hot_config.clone()),
     });
     let query_handler = Arc::new(QueryHandler {
         buffer: buffer.clone(),

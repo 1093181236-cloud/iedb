@@ -160,7 +160,9 @@ impl SnapshotScheduler {
 
     /// Execute one snapshot cycle.
     async fn do_snapshot(&self) -> Result<usize, String> {
-        let snapshot_interval_ns = self.config.snapshot_interval_secs() * 1_000_000_000;
+        // Marker follows the runtime-hot interval too — a hot change must
+        // move the "closed window" boundary, not just the flush cadence.
+        let snapshot_interval_ns = self.current_snapshot_interval().max(1) * 1_000_000_000;
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let end_time_marker = ((now_ns - snapshot_interval_ns) / snapshot_interval_ns)
             * snapshot_interval_ns;

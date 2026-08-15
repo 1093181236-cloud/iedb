@@ -14,6 +14,9 @@ pub struct WriteHandler {
     pub buffer: Arc<Mutex<Buffer>>,
     pub wal: Arc<Mutex<WalManager>>,
     pub config: Arc<Config>,
+    /// Optional runtime-hot config; when present its snapshot_interval
+    /// determines chunk bucketing (server can change it live).
+    pub hot: Option<Arc<crate::agent::hot_config::HotConfig>>,
 }
 
 impl WriteHandler {
@@ -82,7 +85,17 @@ impl WriteHandler {
         };
 
         // Parse line protocol
-        let snapshot_interval_ns = self.config.snapshot_interval_secs().saturating_mul(1_000_000_000);
+        // Chunk bucketing follows the runtime-hot interval when present —
+        // a hot change must reshape windowing, not just the flush cadence.
+        let snapshot_interval_ns = self
+            .hot
+            .as_ref()
+            .map_or_else(
+                || self.config.snapshot_interval_secs(),
+                |h| h.snapshot_interval_secs(),
+            )
+            .max(1)
+            .saturating_mul(1_000_000_000);
         let mut rows_by_table: std::collections::HashMap<String, (Vec<String>, Vec<String>, Vec<Row>)> = std::collections::HashMap::new();
 
         for line in parse_lines(lp_str) {
@@ -305,6 +318,7 @@ mod tests {
             buffer: buffer.clone(),
             wal,
             config,
+            hot: None,
         };
         (handler, buffer, dir)
     }
@@ -315,6 +329,39 @@ mod tests {
             .uri(uri)
             .body(TestBody::from_bytes(Bytes::from(body.to_vec())))
             .unwrap()
+    }
+
+    /// A hot snapshot_interval must reshape chunk bucketing: the same row
+    /// timestamp lands in a different chunk window under the hot value.
+    #[tokio::test]
+    async fn test_hot_interval_changes_chunk_bucketing() {
+        let (mut handler, buffer, _dir) = make_handler(1024, 100).await;
+
+        // Static config: snapshot_interval "1s" → row at t=15s → chunk_time 15
+        let hot = std::sync::Arc::new(crate::agent::hot_config::HotConfig::from_config(
+            &handler.config,
+        ));
+        hot.apply_update(&serde_json::json!({"flush": {"snapshot_interval": "10s"}}));
+        handler.hot = Some(hot);
+
+        // Explicit timestamp 15_000_000_000 ns (LP uses ns)
+        let resp = handler
+            .handle(post_req(
+                "/write?db=mydb",
+                b"cpu,host=a usage=1.5 15000000000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let buf = buffer.lock().await;
+        let table = buf.get_table("mydb", "cpu").unwrap();
+        assert_eq!(table.chunks.len(), 1);
+        assert_eq!(
+            table.chunks[0].chunk_time,
+            10_000_000_000,
+            "hot 10s interval must bucket t=15s into chunk 10s"
+        );
     }
 
     #[tokio::test]
