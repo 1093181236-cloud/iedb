@@ -13,8 +13,10 @@ pub struct CompactionScheduler {
 }
 
 impl CompactionScheduler {
-    /// 后台循环：从 schedule 解析间隔（cron 格式 "0 */N * * *"，提取 N 小时）
-    pub async fn run(&self) {
+    /// 后台循环：从 schedule 解析间隔（cron 格式 "0 */N * * *"，提取 N 小时）。
+    /// 响应 `shutdown`（server 的 Notify）——只在两个合并周期之间退出，
+    /// 不打断进行中的 run_once。
+    pub async fn run(&self, shutdown: std::sync::Arc<tokio::sync::Notify>) {
         if !self.config.enabled {
             return;
         }
@@ -23,9 +25,16 @@ impl CompactionScheduler {
         let interval = tokio::time::Duration::from_secs((hours * 3600) as u64);
         tracing::info!("Compaction scheduler: every {}h", hours);
         loop {
-            tokio::time::sleep(interval).await;
-            if let Err(e) = self.run_once().await {
-                tracing::warn!("Compaction error: {}", e);
+            tokio::select! {
+                _ = shutdown.notified() => {
+                    tracing::info!("Compaction scheduler shutting down");
+                    break;
+                }
+                _ = tokio::time::sleep(interval) => {
+                    if let Err(e) = self.run_once().await {
+                        tracing::warn!("Compaction error: {}", e);
+                    }
+                }
             }
         }
     }
@@ -298,6 +307,29 @@ mod tests_compaction {
         s.config.enabled = false;
         // run() 是 async 且永不返回，禁用时应立即结束
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(s.run());
+        rt.block_on(s.run(std::sync::Arc::new(tokio::sync::Notify::new())));
+    }
+
+    /// A shutdown signal must return the run loop promptly (it only
+    /// responds between merge cycles, never mid-cycle).
+    #[tokio::test]
+    async fn test_run_returns_on_shutdown() {
+        let dir = tempdir().unwrap();
+        let mut s = scheduler(dir.path(), 1);
+        // 1 小时间隔：若不响应 shutdown，测试会因无数据可合并而长期挂起
+        s.config.schedule = "0 */1 * * *".into();
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let s2 = shutdown.clone();
+        let handle = tokio::spawn(async move { s.run(s2).await });
+
+        // 给循环一点时间进入 sleep，然后发关闭信号
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        shutdown.notify_waiters();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(
+            result.is_ok(),
+            "run() must return after the shutdown signal"
+        );
     }
 }

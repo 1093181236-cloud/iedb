@@ -60,14 +60,27 @@ pub async fn run_server(config: Arc<Config>, include_agent_api: bool) -> Result<
     ));
     TableProvider::register_all(&engine, &query_cfg.data_dir).await?;
 
-    // Compaction 后台任务
+    // I6: graceful shutdown via Ctrl-C — created before the background tasks
+    // so every task can listen to the same signal.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    {
+        let s = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("Server shutdown signal received");
+            s.notify_waiters();
+        });
+    }
+
+    // Compaction 后台任务（响应 shutdown，两个合并周期之间退出）
     if let Some(compaction_cfg) = config.compaction.as_ref() {
         let scheduler = CompactionScheduler {
             data_dir: query_cfg.data_dir.clone(),
             metadata: metadata.clone(),
             config: compaction_cfg.clone(),
         };
-        tokio::spawn(async move { scheduler.run().await; });
+        let compaction_shutdown = shutdown.clone();
+        tokio::spawn(async move { scheduler.run(compaction_shutdown).await; });
     }
 
     // HTTP handlers
@@ -102,18 +115,9 @@ pub async fn run_server(config: Arc<Config>, include_agent_api: bool) -> Result<
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Server listening on http://{}", addr);
 
-    // I6: graceful shutdown via Ctrl-C
-    let shutdown = Arc::new(tokio::sync::Notify::new());
+    // Accept loop — breaks on the shutdown signal created above.
     let shutdown_waiter = shutdown.notified();
     tokio::pin!(shutdown_waiter);
-    {
-        let s = shutdown.clone();
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("Server shutdown signal received");
-            s.notify_waiters();
-        });
-    }
 
     loop {
         let (stream, _) = tokio::select! {
