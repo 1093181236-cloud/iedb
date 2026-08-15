@@ -73,10 +73,16 @@ pub fn staging_save(
     let dir = staging_dir.join(db).join(table);
     fs::create_dir_all(&dir)?;
 
+    // Atomic replace: write the full content to a .tmp sibling, fsync it,
+    // then rename onto the final name. A crash mid-write leaves only the
+    // .tmp (reaped by the retry loop), never a truncated file under the
+    // final name — a partial file there would be uploaded as authoritative.
     let path = dir.join(format!("{}.parquet", chunk_time));
-    let mut f = fs::File::create(&path)?;
+    let tmp_path = dir.join(format!("{}.parquet.tmp", chunk_time));
+    let mut f = fs::File::create(&tmp_path)?;
     std::io::Write::write_all(&mut f, data)?;
     f.sync_all()?;
+    fs::rename(&tmp_path, &path)?;
     // fsync the directory so the file entry itself is durable
     if let Ok(d) = fs::File::open(&dir) {
         let _ = d.sync_all();
@@ -179,6 +185,31 @@ mod tests {
         let files: Vec<_> = fs::read_dir(&dir).unwrap().collect();
         assert_eq!(files.len(), 1, "same chunk_time must not stack files");
         assert_eq!(fs::read(&path1).unwrap(), b"second attempt");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// The save must replace the file atomically (tmp + rename): a file
+    /// handle opened before the save still sees the OLD complete content —
+    /// with a truncate-in-place write it would see the new bytes, which is
+    /// how a crash mid-write exposes a partial file under the final name.
+    #[test]
+    fn test_staging_save_is_atomic_via_rename() {
+        use std::io::Read;
+        let tmp = test_staging_dir();
+
+        let path = staging_save(&tmp, "db", "tbl", 1700000000000000000, b"AAAA").unwrap();
+        let old_handle = std::fs::File::open(&path).unwrap();
+
+        // Second save of the same chunk_time replaces the file.
+        staging_save(&tmp, "db", "tbl", 1700000000000000000, b"BBBBBBBB").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"BBBBBBBB");
+
+        // The fd opened BEFORE the replace must still read the old bytes:
+        // rename semantics, not truncate-in-place.
+        let mut buf = String::new();
+        old_handle.take(u64::MAX).read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "AAAA", "old fd must see the old complete content after an atomic replace");
 
         let _ = fs::remove_dir_all(&tmp);
     }

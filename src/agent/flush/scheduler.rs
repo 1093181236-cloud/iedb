@@ -447,6 +447,14 @@ impl SnapshotScheduler {
                 {
                     let file_entry = file_entry.map_err(|e| format!("staging file: {}", e))?;
                     let name = file_entry.file_name().to_string_lossy().to_string();
+                    // Stale .tmp from a crashed staging write: the live chunk
+                    // is still in the buffer and will be re-staged, so the
+                    // partial file is never authoritative — reap it.
+                    if name.ends_with(".parquet.tmp") {
+                        let _ = std::fs::remove_file(file_entry.path());
+                        tracing::info!(path = %file_entry.path().display(), "Reaped stale staging tmp");
+                        continue;
+                    }
                     let chunk_time = match name
                         .strip_suffix(".parquet")
                         .and_then(|s| s.parse::<i64>().ok())
@@ -948,6 +956,9 @@ mod tests {
         // old-format timestamp-named file (pre chunk_time naming)
         let legacy = staging_dir.join("20260809_052051_190585464.parquet");
         std::fs::write(&legacy, b"old data").unwrap();
+        // stale .tmp leftover from a crashed staging write — must be reaped
+        let stale_tmp = staging_dir.join("999.parquet.tmp");
+        std::fs::write(&stale_tmp, b"partial").unwrap();
 
         let wal_cfg = crate::config::WalConfig {
             flush_interval_secs: 1,
@@ -986,6 +997,7 @@ mod tests {
         assert_eq!(retried, 1, "only the chunk_time-named file is retried");
         assert!(!valid.exists(), "valid file must be delivered and deleted");
         assert!(legacy.exists(), "legacy-named file must be left untouched");
+        assert!(!stale_tmp.exists(), "stale .tmp files must be reaped");
         let seen = seen.lock().await;
         assert_eq!(seen.len(), 1, "only one upload attempt for the valid file");
         assert!(seen[0].contains("chunk_time=123"));

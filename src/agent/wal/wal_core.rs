@@ -34,11 +34,14 @@ impl WalManager {
         fs::create_dir_all(&meta_dir)?;
 
         // Find max existing WAL seq and flushed seq
-        let _flushed_wal_seq = Self::load_last_snapshot(&meta_dir);
+        let flushed_seq = Self::load_last_snapshot(&meta_dir);
         let max_existing = Self::max_wal_seq(&wal_dir);
 
-        // Start from the next available sequence
-        let next_seq = max_existing.map(|s| s + 1).unwrap_or(1);
+        // Start from the next available sequence. The flushed watermark
+        // participates: after a full drain the WAL dir is empty and the meta
+        // holds a high flushed seq — restarting at 1 would produce files
+        // that replay skips (seq <= flushed_seq), silently losing the run.
+        let next_seq = max_existing.unwrap_or(0).max(flushed_seq) + 1;
 
         Ok(WalManager {
             wal_dir,
@@ -314,6 +317,54 @@ mod tests {
             matches!(wm.buffer_op(WalOp::Noop), Err(WalError::BufferFull(_))),
             "second op must be rejected by the hot limit"
         );
+    }
+
+    /// After a full drain (cleanup deletes every file and the meta records
+    /// the high flushed seq), a restart must NOT restart the sequence at 1 —
+    /// fresh files with seqs ≤ flushed_seq would be skipped by replay and the
+    /// run's writes would be lost on the next restart.
+    #[tokio::test]
+    async fn test_seq_does_not_restart_after_full_drain() {
+        use crate::agent::buffer::Buffer;
+        let tmp = test_data_dir();
+        let config = WalConfig {
+            flush_interval_secs: 1,
+            max_write_buffer_ops: 100,
+        };
+
+        // First manager: one flush → file seq 1
+        let mut wm1 = WalManager::new(&tmp, &config).await.unwrap();
+        wm1.buffer_op(WalOp::Noop).unwrap();
+        wm1.flush().await.unwrap();
+        // Handoff drains everything: cleanup(1) + meta flushed_wal_seq=1
+        wm1.cleanup(1).await;
+        std::fs::create_dir_all(tmp.join("meta")).unwrap();
+        let meta = serde_json::json!({"flushed_wal_seq": 1u64});
+        std::fs::write(tmp.join("meta").join("last_snapshot.json"), meta.to_string()).unwrap();
+
+        // Restart: the sequence must continue past the flushed watermark
+        let mut wm2 = WalManager::new(&tmp, &config).await.unwrap();
+        assert!(
+            wm2.current_sequence() > 1,
+            "seq must not restart below the flushed watermark, got {}",
+            wm2.current_sequence()
+        );
+        wm2.buffer_op(WalOp::Noop).unwrap();
+        wm2.flush().await.unwrap();
+
+        // Restart again: replay must restore the new run's op (its file seq
+        // is above the stale flushed_seq gate).
+        let mut wm3 = WalManager::new(&tmp, &config).await.unwrap();
+        let buffer = tokio::sync::Mutex::new(Buffer::new());
+        wm3.replay(&buffer).await.unwrap();
+        // (Noop ops don't produce buffer rows — assert on seq continuity instead.)
+        assert!(
+            wm3.current_sequence() > wm2.current_sequence() || wm3.current_sequence() >= 2,
+            "sequence must keep advancing across restarts, got {}",
+            wm3.current_sequence()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
