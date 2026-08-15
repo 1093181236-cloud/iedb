@@ -39,6 +39,58 @@ pub struct MetadataStore {
     db: Arc<Db>,
 }
 
+/// Read Parquet footer statistics: overall time range of the `time` column
+/// (INT64, little-endian min/max), row count, and field type definitions.
+/// Shared by ingest (per-file stats on upload) and compaction (per-file
+/// stats when recounting a table).
+pub fn read_parquet_stats(
+    path: &std::path::Path,
+) -> Result<(i64, i64, usize, Vec<(String, String)>), Box<dyn std::error::Error>> {
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+    let file = std::fs::File::open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let meta = reader.metadata();
+    let file_meta = meta.file_metadata();
+    let row_count = file_meta.num_rows() as usize;
+
+    let mut time_min = i64::MAX;
+    let mut time_max = i64::MIN;
+    let mut field_defs = Vec::new();
+
+    for row_group in meta.row_groups() {
+        for col in row_group.columns() {
+            let col_desc = col.column_descr();
+            let name = col_desc.name().to_string();
+            let col_path = col_desc.path().string();
+            if col_path == "time" {
+                if let Some(stats) = col.statistics() {
+                    // parquet 52 API: min_bytes()/max_bytes() panic when unset,
+                    // so guard with has_min_max_set() (min_bytes_opt is 53+)
+                    if stats.has_min_max_set() {
+                        let min_val =
+                            i64::from_le_bytes(stats.min_bytes().try_into().unwrap_or([0; 8]));
+                        let max_val =
+                            i64::from_le_bytes(stats.max_bytes().try_into().unwrap_or([0; 8]));
+                        time_min = time_min.min(min_val);
+                        time_max = time_max.max(max_val);
+                    }
+                }
+            } else {
+                let type_str = format!("{:?}", col_desc.physical_type());
+                field_defs.push((name, type_str));
+            }
+        }
+    }
+
+    Ok((
+        if time_min == i64::MAX { 0 } else { time_min },
+        if time_max == i64::MIN { 0 } else { time_max },
+        row_count,
+        field_defs,
+    ))
+}
+
 impl MetadataStore {
     pub fn new(db: Arc<Db>) -> Self {
         MetadataStore { db }
@@ -252,6 +304,63 @@ impl MetadataStore {
         ids.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("list table agents collect: {}", e))
     }
+
+    /// Recompute a table's time range and total_rows by scanning every
+    /// Parquet file currently in `{data_dir}/{db}/{table}`. REPLACE
+    /// semantics — unlike update_stats this does not accumulate, so it is
+    /// the correct call after compaction merges files (the merged file
+    /// contains the same rows as its inputs).
+    pub async fn recount_table(
+        &self,
+        db: &str,
+        table: &str,
+        data_dir: &std::path::Path,
+    ) -> Result<(), String> {
+        let table_dir = data_dir.join(db).join(table);
+        let mut time_min = i64::MAX;
+        let mut time_max = i64::MIN;
+        let mut total_rows: i64 = 0;
+
+        if table_dir.exists() {
+            for entry in std::fs::read_dir(&table_dir).map_err(|e| format!("read table dir: {}", e))? {
+                let entry = entry.map_err(|e| format!("table entry: {}", e))?;
+                let path = entry.path();
+                if !path.extension().map_or(false, |e| e == "parquet") {
+                    continue;
+                }
+                match read_parquet_stats(&path) {
+                    Ok((tmin, tmax, rows, _)) => {
+                        time_min = time_min.min(tmin);
+                        time_max = time_max.max(tmax);
+                        total_rows += rows as i64;
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), "recount: skip unreadable file: {}", e);
+                    }
+                }
+            }
+        }
+
+        let conn = self.db.conn().lock().await;
+        conn.execute("INSERT OR IGNORE INTO databases (name) VALUES (?1)", params![db])
+            .map_err(|e| format!("ensure db: {}", e))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO tables (db_name, table_name) VALUES (?1, ?2)",
+            params![db, table],
+        )
+        .map_err(|e| format!("ensure table: {}", e))?;
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let time_min = if time_min == i64::MAX { None } else { Some(time_min) };
+        let time_max = if time_max == i64::MIN { None } else { Some(time_max) };
+        conn.execute(
+            "UPDATE tables SET time_min=?1, time_max=?2, total_rows=?3, updated_at=?4 \
+             WHERE db_name=?5 AND table_name=?6",
+            params![time_min, time_max, total_rows, now_ms, db, table],
+        )
+        .map_err(|e| format!("recount update: {}", e))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -344,6 +453,66 @@ mod tests {
         assert_eq!(detail.fields[0].name, "usage");
         assert_eq!(detail.fields[0].value_type, "Float");
         assert_eq!(detail.sources, vec!["agent-1".to_string(), "agent-2".to_string()]);
+    }
+
+    /// Build a parquet file with the given time column values (usage fixed).
+    fn parquet_with_times(times: &[i64]) -> Vec<u8> {
+        use parquet::data_type::{DoubleType, Int64Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+        let schema = Arc::new(
+            parse_message_type("message schema { required int64 time; optional double usage; }")
+                .unwrap(),
+        );
+        let mut buf = Vec::new();
+        let props = Arc::new(WriterProperties::new());
+        let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+        let mut row_group = writer.next_row_group().unwrap();
+        {
+            let mut col = row_group.next_column().unwrap().unwrap();
+            col.typed::<Int64Type>().write_batch(times, None, None).unwrap();
+            col.close().unwrap();
+        }
+        {
+            let mut col = row_group.next_column().unwrap().unwrap();
+            let defs: Vec<i16> = vec![1; times.len()];
+            let usage: Vec<f64> = times.iter().map(|t| *t as f64 / 100.0).collect();
+            col.typed::<DoubleType>().write_batch(&usage, Some(&defs), None).unwrap();
+            col.close().unwrap();
+        }
+        row_group.close().unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_recount_table_replaces_stats() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(Db::open(&db_path).unwrap());
+        let store = MetadataStore::new(db);
+        let data_dir = dir.path().join("data");
+
+        // Two files with different time ranges: 1000-2000 and 5000
+        let table_dir = data_dir.join("metrics").join("cpu");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("a.parquet"), parquet_with_times(&[1000, 2000])).unwrap();
+        std::fs::write(table_dir.join("b.parquet"), parquet_with_times(&[5000])).unwrap();
+
+        store.recount_table("metrics", "cpu", &data_dir).await.unwrap();
+        let detail = store.get_table("metrics", "cpu").await.unwrap().unwrap();
+        assert_eq!(detail.row_count, 3);
+        assert_eq!(detail.time_min, Some(1000));
+        assert_eq!(detail.time_max, Some(5000));
+
+        // Remove one file and recount: REPLACE semantics, not accumulate
+        std::fs::remove_file(table_dir.join("a.parquet")).unwrap();
+        store.recount_table("metrics", "cpu", &data_dir).await.unwrap();
+        let detail = store.get_table("metrics", "cpu").await.unwrap().unwrap();
+        assert_eq!(detail.row_count, 1, "recount must replace, not accumulate");
+        assert_eq!(detail.time_min, Some(5000));
+        assert_eq!(detail.time_max, Some(5000));
     }
 
     #[tokio::test]

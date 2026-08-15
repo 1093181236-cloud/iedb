@@ -127,6 +127,12 @@ impl CompactionScheduler {
                     files = small_files.len(),
                     "Compaction complete"
                 );
+
+                // 后置：合并后文件集合变化（删旧 + 写新），用替换语义重算
+                // 该表的时间范围和总行数。update_stats 是累加语义，会重复计数。
+                if let Err(e) = self.metadata.recount_table(&db_name, &table_name, &self.data_dir).await {
+                    tracing::warn!(db = %db_name, table = %table_name, "compaction recount: {}", e);
+                }
             }
         }
         Ok(())
@@ -200,7 +206,19 @@ mod tests_compaction {
         let dir = tempdir().unwrap();
         seed_table(dir.path(), "metrics", "cpu", 3);
 
-        scheduler(dir.path(), 1).run_once().await.unwrap();
+        let s = scheduler(dir.path(), 1);
+        // Pre-seed the metadata with the pre-compaction state (9 rows).
+        s.metadata
+            .update_stats(
+                "metrics", "cpu",
+                1000, 3000, 9,
+                &[("usage".to_string(), "DOUBLE".to_string())],
+                &[],
+            )
+            .await
+            .unwrap();
+
+        s.run_once().await.unwrap();
 
         let table_dir = dir.path().join("metrics").join("cpu");
         let files = files_in(&table_dir);
@@ -217,6 +235,13 @@ mod tests_compaction {
             .await
             .unwrap();
         assert_eq!(df.count().await.unwrap(), 9);
+
+        // 后置步骤：metadata 用替换语义重算 — 行数必须仍是 9，
+        // 累加语义会变成 18（重复计数）。
+        let detail = s.metadata.get_table("metrics", "cpu").await.unwrap().unwrap();
+        assert_eq!(detail.row_count, 9, "compaction must not double-count rows");
+        assert_eq!(detail.time_min, Some(1000));
+        assert_eq!(detail.time_max, Some(3000));
     }
 
     #[tokio::test]

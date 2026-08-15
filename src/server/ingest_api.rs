@@ -114,7 +114,7 @@ impl IngestApiHandler {
         // 读取 Parquet footer stats 并更新元数据。
         // 注意：read_parquet_stats 的 Err 含 Box<dyn Error>（非 Send），
         // 必须在此处消化掉，避免非 Send 值跨越 .await（server 连接需要 Send future）。
-        let stats = read_parquet_stats(&filepath)
+        let stats = crate::server::metadata_store::read_parquet_stats(&filepath)
             .map_err(|e| {
                 tracing::warn!("failed to read parquet stats from {}: {}", filepath.display(), e);
             })
@@ -163,52 +163,6 @@ fn sanitize_filename_part(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
         .collect()
-}
-
-/// Read Parquet footer statistics: overall time range of the `time` column
-/// (INT64, little-endian min/max), row count, and field type definitions.
-fn read_parquet_stats(path: &Path) -> Result<(i64, i64, usize, Vec<(String, String)>), Box<dyn std::error::Error>> {
-    use parquet::file::reader::FileReader;
-    use parquet::file::serialized_reader::SerializedFileReader;
-    let file = std::fs::File::open(path)?;
-    let reader = SerializedFileReader::new(file)?;
-    let meta = reader.metadata();
-    let file_meta = meta.file_metadata();
-    let row_count = file_meta.num_rows() as usize;
-
-    let mut time_min = i64::MAX;
-    let mut time_max = i64::MIN;
-    let mut field_defs = Vec::new();
-
-    for row_group in meta.row_groups() {
-        for col in row_group.columns() {
-            let col_desc = col.column_descr();
-            let name = col_desc.name().to_string();
-            let col_path = col_desc.path().string();
-            if col_path == "time" {
-                if let Some(stats) = col.statistics() {
-                    // parquet 52 API: min_bytes()/max_bytes() panic when unset,
-                    // so guard with has_min_max_set() (min_bytes_opt is 53+)
-                    if stats.has_min_max_set() {
-                        let min_val = i64::from_le_bytes(stats.min_bytes().try_into().unwrap_or([0; 8]));
-                        let max_val = i64::from_le_bytes(stats.max_bytes().try_into().unwrap_or([0; 8]));
-                        time_min = time_min.min(min_val);
-                        time_max = time_max.max(max_val);
-                    }
-                }
-            } else {
-                let type_str = format!("{:?}", col_desc.physical_type());
-                field_defs.push((name, type_str));
-            }
-        }
-    }
-
-    Ok((
-        if time_min == i64::MAX { 0 } else { time_min },
-        if time_max == i64::MIN { 0 } else { time_max },
-        row_count,
-        field_defs,
-    ))
 }
 
 fn json_err(status: u16, code: &str) -> Response<String> {
@@ -466,16 +420,5 @@ mod tests {
         assert_eq!(sanitize_filename_part("agent-1"), "agent-1");
         assert_eq!(sanitize_filename_part("a/b"), "a_b");
         assert_eq!(sanitize_filename_part("a b"), "a_b");
-    }
-
-    #[test]
-    fn test_read_parquet_stats() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("t.parquet");
-        std::fs::write(&path, make_test_parquet()).unwrap();
-
-        let (time_min, time_max, row_count, field_defs) = read_parquet_stats(&path).unwrap();
-        assert_eq!((time_min, time_max, row_count), (1000, 3000, 3));
-        assert_eq!(field_defs, vec![("usage".to_string(), "DOUBLE".to_string())]);
     }
 }
